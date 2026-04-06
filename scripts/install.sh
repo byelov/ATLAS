@@ -242,7 +242,7 @@ detect_existing_setup() {
     fi
 
     # Check if ATLAS services are already running
-    RUNNING_PODS=$(kubectl get pods -n "$ATLAS_NAMESPACE" --field-selector=status.phase=Running --no-headers 2>/dev/null | wc -l)
+    RUNNING_PODS=$(kubectl get pods -n "$ATLAS_NAMESPACE" --field-selector=status.phase=Running --no-headers 2>/dev/null | wc -l) || true
     RUNNING_PODS=${RUNNING_PODS:-0}
     if [[ "$RUNNING_PODS" -gt 0 ]]; then
         log_info "  [FOUND] $RUNNING_PODS ATLAS pod(s) already running"
@@ -308,48 +308,80 @@ install_gpu_operator() {
     # Double-check GPU availability
     if check_gpu_available; then
         log_info "GPU already available in cluster (nvidia.com/gpu detected)"
-        log_info "Skipping GPU Operator installation"
         return
     fi
 
-    # Check if GPU Operator is already installed
+    # Install or upgrade GPU Operator if not already present
     if kubectl get namespace gpu-operator &> /dev/null; then
         log_info "GPU Operator namespace exists, checking status..."
         if kubectl get pods -n gpu-operator 2>/dev/null | grep -q "Running"; then
-            log_info "GPU Operator already running"
-            return
+            log_info "GPU Operator pods are running - waiting for GPU label to appear..."
+        else
+            log_info "GPU Operator installed but pods not yet running..."
         fi
+    else
+        log_info "Installing NVIDIA GPU Operator..."
+
+        # Add Helm repo
+        if ! command -v helm &> /dev/null; then
+            log_info "Installing Helm..."
+            curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+        fi
+
+        helm repo add nvidia https://helm.ngc.nvidia.com/nvidia || true
+        helm repo update
+
+        kubectl create namespace gpu-operator || true
     fi
 
-    log_info "Installing NVIDIA GPU Operator..."
-
-    # Add Helm repo
+    # Use upgrade --install so this is always idempotent (safe to re-run)
     if ! command -v helm &> /dev/null; then
         log_info "Installing Helm..."
         curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
     fi
-
-    helm repo add nvidia https://helm.ngc.nvidia.com/nvidia || true
+    helm repo add nvidia https://helm.ngc.nvidia.com/nvidia 2>/dev/null || true
     helm repo update
 
-    # Install GPU Operator
-    kubectl create namespace gpu-operator || true
-    helm install gpu-operator nvidia/gpu-operator \
+    # K3s uses non-standard containerd paths that the GPU Operator must be told about.
+    # Without these, nvidia-container-toolkit-daemonset enters CrashLoopBackOff and
+    # all dependent pods stay stuck in Init:0/1.
+    helm upgrade --install gpu-operator nvidia/gpu-operator \
         --namespace gpu-operator \
         --set driver.enabled=false \
+        --set toolkit.env[0].name=CONTAINERD_SOCKET \
+        --set toolkit.env[0].value=/run/k3s/containerd/containerd.sock \
+        --set toolkit.env[1].name=CONTAINERD_CONFIG \
+        --set toolkit.env[1].value=/var/lib/rancher/k3s/agent/etc/containerd/config.toml \
+        --set toolkit.env[2].name=CONTAINERD_RESTART_SERVICES \
+        --set toolkit.env[2].value=k3s \
         --wait --timeout 10m
 
-    # Wait for GPU to be available
-    log_info "Waiting for GPU to be available in cluster..."
-    for i in {1..30}; do
+    # Wait for GPU Operator pods to reach Running state first
+    log_info "Waiting for GPU Operator pods to start (this may take several minutes while images are pulled)..."
+    kubectl wait --for=condition=Ready pod \
+        -l app.kubernetes.io/name=gpu-operator \
+        -n gpu-operator \
+        --timeout=600s 2>/dev/null || true
+
+    # Then wait for the device plugin to label the node with nvidia.com/gpu
+    log_info "Waiting for GPU to be available in cluster (up to 15 minutes)..."
+    for i in {1..90}; do
         if check_gpu_available; then
             log_info "GPU available in cluster"
             return
         fi
+        if (( i % 6 == 0 )); then
+            log_info "  Still waiting... (${i}0s elapsed, up to 900s)"
+            # Show any pods that aren't Ready yet to help diagnose stalls
+            kubectl get pods -n gpu-operator --no-headers 2>/dev/null \
+                | grep -v Running | grep -v Completed | head -5 || true
+        fi
         sleep 10
     done
 
-    log_error "GPU not detected in cluster after 5 minutes"
+    log_error "GPU not detected in cluster after 15 minutes"
+    log_error "Check GPU Operator pod status: kubectl get pods -n gpu-operator"
+    log_error "Check device plugin logs:       kubectl logs -n gpu-operator -l app=nvidia-device-plugin-daemonset"
     exit 1
 }
 
@@ -359,7 +391,7 @@ setup_namespace() {
 
     # Create namespace if not default
     if [[ "$ATLAS_NAMESPACE" != "default" ]]; then
-        kubectl create namespace "$ATLAS_NAMESPACE" || true
+        kubectl create namespace "$ATLAS_NAMESPACE" 2>/dev/null || true
     fi
 
     # Create secrets if they don't exist
@@ -512,6 +544,8 @@ main() {
     fi
 
     install_k3s
+    # Ensure KUBECONFIG is set for all subsequent steps (helm, kubectl)
+    export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
     install_gpu_operator
     setup_namespace
     build_images
