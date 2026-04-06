@@ -88,12 +88,13 @@ type ChatMessage struct {
 }
 
 type ChatRequest struct {
-	Model       string        `json:"model"`
-	Messages    []ChatMessage `json:"messages"`
-	MaxTokens   int           `json:"max_tokens,omitempty"`
-	Temperature float64       `json:"temperature,omitempty"`
-	Stream      bool          `json:"stream,omitempty"`
-	Stop        []string      `json:"stop,omitempty"`
+	Model              string        `json:"model"`
+	Messages           []ChatMessage `json:"messages"`
+	MaxTokens          int           `json:"max_tokens,omitempty"`
+	Temperature        float64       `json:"temperature,omitempty"`
+	Stream             bool          `json:"stream,omitempty"`
+	Stop               []string      `json:"stop,omitempty"`
+	ChatTemplateKwargs map[string]any `json:"chat_template_kwargs,omitempty"`
 }
 
 type ChatChoice struct {
@@ -360,14 +361,70 @@ func buildRepairPrompt(code string, analysis ErrorAnalysis, attempt int) string 
 // Fox communication
 // ---------------------------------------------------------------------------
 
+// normalizeMessages fixes message sequences that would crash the Qwen3.5 Jinja
+// chat template. Specifically, Aider sends a trailing `system` role message as
+// a format reminder (e.g. "You MUST use this *file listing* format…") after the
+// user/assistant turn sequence. Qwen3.5's template only handles `system` at
+// position 0 — any subsequent `system` role causes HTTP 500.
+//
+// Fix: merge each non-first system message into the preceding user message
+// (or make it the next user message if it's the very last message).
+func normalizeMessages(messages []ChatMessage) []ChatMessage {
+	if len(messages) == 0 {
+		return messages
+	}
+	out := make([]ChatMessage, 0, len(messages))
+	seenSystem := false
+	for i, m := range messages {
+		if m.Role == "system" {
+			if !seenSystem {
+				seenSystem = true
+				out = append(out, m)
+				continue
+			}
+			// Trailing system message: append to preceding user message if
+			// present, otherwise convert to a user message.
+			appended := false
+			for j := len(out) - 1; j >= 0; j-- {
+				if out[j].Role == "user" {
+					out[j] = ChatMessage{Role: "user", Content: out[j].Content + "\n\n" + m.Content}
+					appended = true
+					break
+				}
+			}
+			if !appended {
+				// No prior user message — convert to user
+				out = append(out, ChatMessage{Role: "user", Content: m.Content})
+			}
+			_ = i
+			continue
+		}
+		out = append(out, m)
+	}
+	return out
+}
+
 func forwardToFox(ctx context.Context, req ChatRequest) (*ChatResponse, error) {
 	req.Model = modelName
+
+	// Qwen3.5 Jinja template crashes on system messages after position 0.
+	// Normalize before sending to llama-server.
+	req.Messages = normalizeMessages(req.Messages)
 
 	// Ensure a max_tokens cap so the model doesn't think forever.
 	// Aider sends 32768; internal classifier calls send 5.
 	// Guard against caller omitting it entirely (would allow unbounded thinking).
 	if req.MaxTokens == 0 {
 		req.MaxTokens = 8192
+	}
+
+	// Disable thinking mode via jinja template kwargs.
+	// This prevents Qwen3.5 from entering the <think>...</think> reasoning loop,
+	// which would otherwise consume thousands of tokens before producing output.
+	if req.ChatTemplateKwargs == nil {
+		req.ChatTemplateKwargs = map[string]any{"enable_thinking": false}
+	} else if _, ok := req.ChatTemplateKwargs["enable_thinking"]; !ok {
+		req.ChatTemplateKwargs["enable_thinking"] = false
 	}
 
 	// Inject /nothink into the LAST user message (not necessarily the last message)
@@ -1845,6 +1902,20 @@ func handleStreamingChat(w http.ResponseWriter, r *http.Request, req ChatRequest
 				}
 				if currentMsg != "" {
 					stripped := strings.TrimPrefix(currentMsg, "/nothink\n")
+					// Trim Aider's appended format-reminder instructions before filename extraction.
+					// Aider appends things like "\n\nTo suggest changes..." or "# File editing rules"
+					// which contain placeholder filenames like "path/to/filename.js".
+					for _, trimMarker := range []string{
+						"\n\nTo suggest changes",
+						"\n\n# File editing rules",
+						"\n\nIMPLEMENTATION CHECKLIST",
+						"\n\nYou MUST use",
+						"\n\nRemember,",
+					} {
+						if idx := strings.Index(stripped, trimMarker); idx > 0 {
+							stripped = stripped[:idx]
+						}
+					}
 					matches := filenameRe.FindAllString(stripped, -1)
 					for _, m := range matches {
 						dotIdx := strings.LastIndex(m, ".")
@@ -1858,6 +1929,11 @@ func handleStreamingChat(w http.ResponseWriter, r *http.Request, req ChatRequest
 						baseName := m
 						if si := strings.LastIndex(m, "/"); si >= 0 {
 							baseName = m[si+1:]
+						}
+						// Reject placeholder filenames (e.g. "filename.js", "path/to/filename.js")
+						if strings.HasPrefix(m, "path/to/") || baseName == "filename"+ext ||
+							strings.HasPrefix(baseName, "filename.") {
+							continue
 						}
 						if len(baseName) > 0 && baseName[0] >= 'A' && baseName[0] <= 'Z' && !strings.Contains(m, "/") {
 							continue
@@ -1887,6 +1963,10 @@ func handleStreamingChat(w http.ResponseWriter, r *http.Request, req ChatRequest
 					}
 				}
 			}
+
+			// Priority 3: infer filename from generated code when user didn't specify one.
+			// E.g. "Create a FastAPI app" → model generates Python → infer "app.py".
+			// (deferred: featureUserMsg not yet extracted — done after feature extraction block)
 
 			// Normalize to Aider whole-file format
 			normalized, didNorm := normalizeToWholeFile(content, userHintFilename)
@@ -1925,6 +2005,18 @@ func handleStreamingChat(w http.ResponseWriter, r *http.Request, req ChatRequest
 					if !strings.HasPrefix(c, "# *SEARCH/REPLACE") && !strings.HasPrefix(c, "To suggest changes") {
 						featureUserMsg = strings.TrimPrefix(c, "/nothink\n")
 						break
+					}
+				}
+			}
+
+			// Priority 3: infer filename from generated code when user didn't specify one.
+			if userHintFilename == "" {
+				userHintFilename = inferFilenameFromContent(content, featureUserMsg)
+				if userHintFilename != "" {
+					log.Printf("  filename-extract: inferred '%s' from code content", userHintFilename)
+					// Re-normalize now that we have a filename
+					if norm, ok := normalizeToWholeFile(content, userHintFilename); ok {
+						content = norm
 					}
 				}
 			}
@@ -2021,6 +2113,15 @@ func handleStreamingChat(w http.ResponseWriter, r *http.Request, req ChatRequest
 			// Validate: content must have code blocks for Aider to create files
 			blocks := extractCodeBlocks(content)
 			if len(blocks) == 0 && tier >= Tier1Simple {
+				// No code blocks — but if we have non-empty text, deliver it as
+				// a conversational response rather than falling back to stream and
+				// asking the model the exact same question again.
+				if strings.TrimSpace(content) != "" {
+					log.Printf("  buffered response has no code blocks but has text (%d chars) — delivering as conversational", len(content))
+					injectContentDelta(w, flusher, content)
+					sendStreamDone(w, flusher)
+					return
+				}
 				log.Printf("  buffered response has no code blocks — falling back to stream")
 			} else {
 				log.Printf("  delivering %d chars (%d code blocks)", len(content), len(blocks))
@@ -2172,6 +2273,44 @@ func handleStreamingChat(w http.ResponseWriter, r *http.Request, req ChatRequest
 		log.Printf("  buffered generation failed — falling back to stream")
 	}
 
+	// For T0 (conversational), inject /nothink to prevent the model spending all
+	// 150 tokens on a <think> block. For T1+ (code generation), do NOT inject
+	// /nothink — the 9B model needs its reasoning trace to produce complex code.
+	// The think-block filter below strips <think>…</think> tokens from the SSE
+	// stream before they reach Aider; the code after </think> flows through normally.
+	if tier == Tier0Conversational {
+		for i := len(req.Messages) - 1; i >= 0; i-- {
+			if req.Messages[i].Role == "user" && !strings.Contains(req.Messages[i].Content, "/nothink") {
+				req.Messages[i] = ChatMessage{
+					Role:    "user",
+					Content: "/nothink\n" + req.Messages[i].Content,
+				}
+				break
+			}
+		}
+	}
+
+	// Disable thinking mode only for T0 conversational messages in the streaming
+	// fallback. T0 has max_tokens=150 — the model would spend all 150 tokens inside
+	// <think>…</think> leaving nothing for the actual response.
+	//
+	// For T1+ code-generation tasks, thinking MUST be allowed: the 9B model needs
+	// its reasoning trace to produce correct code. The think-block filter above
+	// suppresses <think>…</think> tokens before they reach Aider, and the real
+	// code that follows </think> flows through normally.
+	if tier == Tier0Conversational {
+		if req.ChatTemplateKwargs == nil {
+			req.ChatTemplateKwargs = map[string]any{"enable_thinking": false}
+		} else if _, ok := req.ChatTemplateKwargs["enable_thinking"]; !ok {
+			req.ChatTemplateKwargs["enable_thinking"] = false
+		}
+	}
+
+	// Normalize messages: Qwen3.5 Jinja template crashes on system messages
+	// after position 0. Aider injects a trailing system message as a format
+	// reminder — merge it into the preceding user message.
+	req.Messages = normalizeMessages(req.Messages)
+
 	body, _ := json.Marshal(req)
 
 	foxReq, err := http.NewRequestWithContext(r.Context(), "POST", inferenceURL+"/v1/chat/completions", bytes.NewReader(body))
@@ -2205,6 +2344,10 @@ func handleStreamingChat(w http.ResponseWriter, r *http.Request, req ChatRequest
 	scanner := bufio.NewScanner(foxResp.Body)
 	scanner.Buffer(make([]byte, 1024*1024), 1024*1024) // 1MB buffer
 
+	// Think-block filter state: suppress <think>...</think> tokens from client
+	inThinkBlock := false
+	contentSentDuringStream := 0 // bytes of actual (non-think) content forwarded to client
+
 	for scanner.Scan() {
 		line := scanner.Text()
 		trimmed := strings.TrimSpace(line)
@@ -2214,11 +2357,9 @@ func handleStreamingChat(w http.ResponseWriter, r *http.Request, req ChatRequest
 			break
 		}
 
-		// Forward everything else to client
-		fmt.Fprintf(w, "%s\n", line)
-		flusher.Flush()
+		suppressForward := false
 
-		// Accumulate content from delta events
+		// Accumulate content from delta events and apply think-block filter
 		if strings.HasPrefix(trimmed, "data:") {
 			payload := strings.TrimSpace(trimmed[5:])
 			var event struct {
@@ -2226,31 +2367,73 @@ func handleStreamingChat(w http.ResponseWriter, r *http.Request, req ChatRequest
 					Delta struct {
 						Content string `json:"content"`
 					} `json:"delta"`
+					FinishReason *string `json:"finish_reason"`
 				} `json:"choices"`
 			}
 			if json.Unmarshal([]byte(payload), &event) == nil && len(event.Choices) > 0 {
-				fullContent.WriteString(event.Choices[0].Delta.Content)
+				choice := event.Choices[0]
+				delta := choice.Delta.Content
+				fullContent.WriteString(delta)
+
+				// Filter think blocks: detect open/close tags across chunks
+				if strings.Contains(delta, "<think>") {
+					inThinkBlock = true
+				}
+				if inThinkBlock && strings.Contains(delta, "</think>") {
+					inThinkBlock = false
+					suppressForward = true
+				} else if inThinkBlock {
+					suppressForward = true
+				}
+
+				// Suppress the upstream finish_reason chunk — we always send our own
+				// stop signal via sendStreamDone AFTER any post-stream injection.
+				// Without this, Aider sees finish_reason:stop before injected content
+				// and discards everything that comes after.
+				if choice.FinishReason != nil {
+					suppressForward = true
+				}
+
+				if !suppressForward && len(delta) > 0 {
+					contentSentDuringStream += len(delta)
+				}
 			}
 		}
+
+		if suppressForward {
+			continue
+		}
+
+		// Forward non-think, non-stop data to client
+		fmt.Fprintf(w, "%s\n", line)
+		flusher.Flush()
 	}
 
 	// Stream is done from Fox. Client hasn't received [DONE] yet.
 	content := stripThinkBlock(fullContent.String())
 
-	// Empty response retry — if model produced nothing (think-only), retry non-streamed
-	if strings.TrimSpace(content) == "" {
-		log.Printf("  empty stream response — retrying non-streamed")
-		retryReq := req
-		retryReq.Stream = false
-		retryReq.Temperature = 0.5 // slightly higher temp to break out of think loop
-		retryResp, retryErr := forwardToFox(r.Context(), retryReq)
-		if retryErr == nil && len(retryResp.Choices) > 0 && retryResp.Choices[0].Message.Content != "" {
-			content = retryResp.Choices[0].Message.Content
-			log.Printf("  retry succeeded: %d chars", len(content))
-			// Inject the retry content as SSE chunks (stop chunk sent at end of function)
+	if contentSentDuringStream == 0 {
+		if strings.TrimSpace(content) != "" {
+			// Think-only stream: the model generated everything inside <think>…</think>
+			// and nothing after </think>. stripThinkBlock already extracted the usable
+			// content (code / answer) from inside the think block. Inject it now.
+			log.Printf("  think-only stream — injecting extracted content (%d chars)", len(content))
 			injectContentDelta(w, flusher, content)
 		} else {
-			log.Printf("  retry also empty")
+			// Truly empty stream — model produced nothing at all. Retry non-streamed
+			// with a higher temperature to break out of the think loop.
+			log.Printf("  empty stream response — retrying non-streamed")
+			retryReq := req
+			retryReq.Stream = false
+			retryReq.Temperature = 0.5
+			retryResp, retryErr := forwardToFox(r.Context(), retryReq)
+			if retryErr == nil && len(retryResp.Choices) > 0 && retryResp.Choices[0].Message.Content != "" {
+				content = retryResp.Choices[0].Message.Content
+				log.Printf("  retry succeeded: %d chars", len(content))
+				injectContentDelta(w, flusher, content)
+			} else {
+				log.Printf("  retry also empty")
+			}
 		}
 	}
 
@@ -2796,6 +2979,24 @@ func classifyIntent(ctx context.Context, messages []ChatMessage) Tier {
 		}
 	}
 
+	// Aider's repo-map context messages start with a header like:
+	//   "# USER\nI spoke to you previously..." or contain *SEARCH/REPLACE markers.
+	// These are always edit requests — skip the LLM classify call entirely.
+	if strings.HasPrefix(trimmed, "# USER") ||
+		strings.HasPrefix(trimmed, "# I spoke") ||
+		strings.Contains(trimmed, "*SEARCH*") ||
+		strings.Contains(trimmed, "SEARCH/REPLACE") {
+		if hasFileContext {
+			return Tier2Medium
+		}
+		return Tier1Simple
+	}
+
+	// Very long prompts with file context are edit tasks
+	if len(trimmed) > 2000 && hasFileContext {
+		return Tier2Medium
+	}
+
 	classifyReq := ChatRequest{
 		Model: modelName,
 		Messages: []ChatMessage{
@@ -2827,8 +3028,8 @@ func classifyIntent(ctx context.Context, messages []ChatMessage) Tier {
 		Stop:        []string{"\n"},
 	}
 
-	// Classification timeout — model needs ~1-2s on GPU
-	classifyCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	// Classification timeout — increase to 15s now that thinking is disabled
+	classifyCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 
 	resp, err := forwardToFox(classifyCtx, classifyReq)
@@ -2916,6 +3117,61 @@ func truncate(s string, maxLen int) string {
 		return s
 	}
 	return s[:maxLen] + "..."
+}
+
+// inferFilenameFromContent guesses a sensible filename when the user didn't
+// specify one. It looks at the code language and task keywords.
+func inferFilenameFromContent(content string, userMsg string) string {
+	blocks := extractCodeBlocks(content)
+	lang := ""
+	if len(blocks) > 0 {
+		lang = blocks[0].Language
+	}
+
+	lower := strings.ToLower(content + " " + userMsg)
+
+	switch lang {
+	case "python", "py":
+		if strings.Contains(lower, "fastapi") || strings.Contains(lower, "flask") ||
+			strings.Contains(lower, "starlette") || strings.Contains(lower, "uvicorn") {
+			return "app.py"
+		}
+		if strings.Contains(lower, "game") || strings.Contains(lower, "pygame") {
+			return "game.py"
+		}
+		if strings.Contains(lower, "script") || strings.Contains(lower, "cli") {
+			return "main.py"
+		}
+		if strings.Contains(lower, "test") {
+			return "test_app.py"
+		}
+		return "main.py"
+	case "go":
+		return "main.go"
+	case "javascript", "js", "typescript", "ts":
+		if strings.Contains(lower, "express") || strings.Contains(lower, "fastify") {
+			return "app.js"
+		}
+		if strings.Contains(lower, "react") || strings.Contains(lower, "component") {
+			return "App.tsx"
+		}
+		return "index.js"
+	case "rust", "rs":
+		return "main.rs"
+	case "ruby", "rb":
+		return "app.rb"
+	case "bash", "sh":
+		return "script.sh"
+	}
+
+	// Try to infer from user message task
+	if strings.Contains(lower, "fastapi") || strings.Contains(lower, "flask") {
+		return "app.py"
+	}
+	if strings.Contains(lower, "game") {
+		return "game.py"
+	}
+	return ""
 }
 
 // stripThinkBlock removes a leading <think>...</think> block from model output.
