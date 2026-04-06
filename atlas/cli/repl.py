@@ -16,7 +16,7 @@ def startup_checks() -> bool:
     if fox_ok:
         display.status_block(
             model=fox_model,
-            speed="47 tok/s",
+            speed=client.measure_speed(),
             lens="connected" if rag_ok else "unavailable",
             sandbox="ready" if sandbox_ok else "unavailable",
         )

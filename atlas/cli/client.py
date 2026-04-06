@@ -8,7 +8,7 @@ from typing import Optional, List, Tuple
 
 INFERENCE_URL = os.environ.get("ATLAS_INFERENCE_URL", "http://localhost:8080")
 RAG_API_URL = os.environ.get("ATLAS_RAG_URL", "http://localhost:8099")
-SANDBOX_URL = os.environ.get("ATLAS_SANDBOX_URL", "http://localhost:30820")
+SANDBOX_URL = os.environ.get("ATLAS_SANDBOX_URL", "http://localhost:8020")
 MODEL_NAME = os.environ.get("ATLAS_MODEL_NAME", "Qwen3.5-9B-Q6_K")
 
 
@@ -31,10 +31,32 @@ def _get(url: str, timeout: int = 10) -> dict:
 
 # --- Health checks ---
 
+def measure_speed() -> str:
+    """Fire a tiny completion and return predicted tok/s from server timings."""
+    try:
+        body = {
+            "model": MODEL_NAME,
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 8,
+            "stream": False,
+        }
+        d = _post(f"{INFERENCE_URL}/v1/chat/completions", body, timeout=30)
+        tps = d.get("timings", {}).get("predicted_per_second")
+        if tps is not None:
+            return f"{tps:.0f} tok/s"
+    except Exception:
+        pass
+    return "—"
+
+
 def check_fox() -> Tuple[bool, str]:
     try:
-        d = _get(f"{INFERENCE_URL}/health")
-        model = d.get("model_name", "unknown")
+        _get(f"{INFERENCE_URL}/health")
+        try:
+            models = _get(f"{INFERENCE_URL}/v1/models")
+            model = (models.get("data") or [{}])[0].get("id", "unknown")
+        except Exception:
+            model = "unknown"
         return True, model
     except Exception as e:
         return False, str(e)

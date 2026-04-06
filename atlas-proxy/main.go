@@ -40,7 +40,7 @@ import (
 var (
 	inferenceURL = envOr("ATLAS_INFERENCE_URL", "http://localhost:8080")
 	lensURL     = envOr("ATLAS_LENS_URL", "http://localhost:8099")
-	sandboxURL = envOr("ATLAS_SANDBOX_URL", "http://localhost:30820")
+	sandboxURL = envOr("ATLAS_SANDBOX_URL", "http://localhost:8020")
 	proxyPort  = envOr("ATLAS_PROXY_PORT", "8090")
 	modelName  = envOr("ATLAS_MODEL_NAME", "Qwen3.5-9B-Q6_K")
 )
