@@ -82,8 +82,9 @@ var (
 // ---------------------------------------------------------------------------
 
 type ChatMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role             string `json:"role"`
+	Content          string `json:"content"`
+	ReasoningContent string `json:"reasoning_content,omitempty"`
 }
 
 type ChatRequest struct {
@@ -362,6 +363,13 @@ func buildRepairPrompt(code string, analysis ErrorAnalysis, attempt int) string 
 func forwardToFox(ctx context.Context, req ChatRequest) (*ChatResponse, error) {
 	req.Model = modelName
 
+	// Ensure a max_tokens cap so the model doesn't think forever.
+	// Aider sends 32768; internal classifier calls send 5.
+	// Guard against caller omitting it entirely (would allow unbounded thinking).
+	if req.MaxTokens == 0 {
+		req.MaxTokens = 8192
+	}
+
 	// Inject /nothink into the LAST user message (not necessarily the last message)
 	// to prevent Qwen3.5 from wasting tokens on <think> blocks
 	if len(req.Messages) > 0 {
@@ -399,6 +407,18 @@ func forwardToFox(ctx context.Context, req ChatRequest) (*ChatResponse, error) {
 	var chatResp ChatResponse
 	if err := json.Unmarshal(raw, &chatResp); err != nil {
 		return nil, fmt.Errorf("parse error: %w\nraw: %s", err, truncate(string(raw), 200))
+	}
+	// Normalise each choice:
+	// 1. If content is empty but reasoning_content has data (--reasoning-format deepseek), promote it.
+	// 2. Strip any leading <think>...</think> block (model ignored /nothink).
+	//    Use the text after </think> as actual content; fall back to think content if nothing follows.
+	for i := range chatResp.Choices {
+		c := &chatResp.Choices[i].Message
+		if strings.TrimSpace(c.Content) == "" && strings.TrimSpace(c.ReasoningContent) != "" {
+			c.Content = c.ReasoningContent
+			log.Printf("  forwardToFox: content empty, using reasoning_content (%d chars)", len(c.Content))
+		}
+		c.Content = stripThinkBlock(c.Content)
 	}
 	return &chatResp, nil
 }
@@ -1571,8 +1591,7 @@ func handleStreamingChat(w http.ResponseWriter, r *http.Request, req ChatRequest
 			// Format as Aider whole-file blocks and deliver via SSE
 			aiderContent := formatForAider(agentResult)
 			injectContentDelta(w, flusher, aiderContent)
-			fmt.Fprintf(w, "data: [DONE]\n\n")
-			flusher.Flush()
+			sendStreamDone(w, flusher)
 			lastWasV3.Store(remoteIP, time.Now())
 			return
 		}
@@ -1582,8 +1601,7 @@ func handleStreamingChat(w http.ResponseWriter, r *http.Request, req ChatRequest
 			if aiderContent != "" {
 				injectContentDelta(w, flusher, aiderContent)
 			}
-			fmt.Fprintf(w, "data: [DONE]\n\n")
-			flusher.Flush()
+			sendStreamDone(w, flusher)
 			return
 		}
 		log.Printf("  agent loop: no results — falling through to standard path")
@@ -1655,8 +1673,7 @@ func handleStreamingChat(w http.ResponseWriter, r *http.Request, req ChatRequest
 			lastWasV3.Store(r.RemoteAddr, time.Now())
 
 			injectContentDelta(w, flusher, content)
-			fmt.Fprintf(w, "data: [DONE]\n\n")
-			flusher.Flush()
+			sendStreamDone(w, flusher)
 
 			// Async G(x) scoring
 			go func() {
@@ -1768,8 +1785,7 @@ func handleStreamingChat(w http.ResponseWriter, r *http.Request, req ChatRequest
 				finalContent := strings.TrimSpace(allContent.String())
 				log.Printf("  multi-file: delivering %d files (%d chars)", len(createdFiles), len(finalContent))
 				injectContentDelta(w, flusher, finalContent)
-				fmt.Fprintf(w, "data: [DONE]\n\n")
-				flusher.Flush()
+				sendStreamDone(w, flusher)
 
 				go func() {
 					if score, err := scoreLens(context.Background(), finalContent); err == nil {
@@ -2143,8 +2159,7 @@ func handleStreamingChat(w http.ResponseWriter, r *http.Request, req ChatRequest
 				}
 
 				injectContentDelta(w, flusher, content)
-				fmt.Fprintf(w, "data: [DONE]\n\n")
-				flusher.Flush()
+				sendStreamDone(w, flusher)
 
 				go func() {
 					if score, err := scoreLens(context.Background(), content); err == nil {
@@ -2220,7 +2235,7 @@ func handleStreamingChat(w http.ResponseWriter, r *http.Request, req ChatRequest
 	}
 
 	// Stream is done from Fox. Client hasn't received [DONE] yet.
-	content := fullContent.String()
+	content := stripThinkBlock(fullContent.String())
 
 	// Empty response retry — if model produced nothing (think-only), retry non-streamed
 	if strings.TrimSpace(content) == "" {
@@ -2232,7 +2247,7 @@ func handleStreamingChat(w http.ResponseWriter, r *http.Request, req ChatRequest
 		if retryErr == nil && len(retryResp.Choices) > 0 && retryResp.Choices[0].Message.Content != "" {
 			content = retryResp.Choices[0].Message.Content
 			log.Printf("  retry succeeded: %d chars", len(content))
-			// Inject the retry content as SSE chunks
+			// Inject the retry content as SSE chunks (stop chunk sent at end of function)
 			injectContentDelta(w, flusher, content)
 		} else {
 			log.Printf("  retry also empty")
@@ -2335,9 +2350,8 @@ func handleStreamingChat(w http.ResponseWriter, r *http.Request, req ChatRequest
 		}()
 	}
 
-	// Send [DONE]
-	fmt.Fprintf(w, "data: [DONE]\n\n")
-	flusher.Flush()
+	// Send final stop chunk + [DONE]
+	sendStreamDone(w, flusher)
 }
 
 // detectDeletionIntent checks if the user or model wants to delete files.
@@ -2453,6 +2467,28 @@ func injectContentDelta(w http.ResponseWriter, flusher http.Flusher, text string
 	}
 	data, _ := json.Marshal(chunk)
 	fmt.Fprintf(w, "data: %s\n\n", data)
+	flusher.Flush()
+}
+
+// sendStreamDone sends the required finish_reason:"stop" chunk then data:[DONE].
+// LiteLLM/Aider require an explicit stop chunk to recognise a complete response.
+func sendStreamDone(w http.ResponseWriter, flusher http.Flusher) {
+	stop := map[string]any{
+		"id":      "atlas-verify",
+		"object":  "chat.completion.chunk",
+		"created": time.Now().Unix(),
+		"model":   modelName,
+		"choices": []map[string]any{
+			{
+				"index":         0,
+				"delta":         map[string]string{},
+				"finish_reason": "stop",
+			},
+		},
+	}
+	data, _ := json.Marshal(stop)
+	fmt.Fprintf(w, "data: %s\n\n", data)
+	fmt.Fprintf(w, "data: [DONE]\n\n")
 	flusher.Flush()
 }
 
@@ -2880,6 +2916,29 @@ func truncate(s string, maxLen int) string {
 		return s
 	}
 	return s[:maxLen] + "..."
+}
+
+// stripThinkBlock removes a leading <think>...</think> block from model output.
+// If the model ignored /nothink and generated a think block, the actual answer
+// is everything after </think>. Falls back to the think content if nothing follows.
+func stripThinkBlock(s string) string {
+	trimmed := strings.TrimSpace(s)
+	if !strings.HasPrefix(trimmed, "<think>") {
+		return s
+	}
+	end := strings.Index(trimmed, "</think>")
+	if end == -1 {
+		// Unterminated think block — strip the <think> prefix and return the rest
+		after := strings.TrimPrefix(trimmed, "<think>")
+		return strings.TrimSpace(after)
+	}
+	after := strings.TrimSpace(trimmed[end+len("</think>"):])
+	if after == "" {
+		// Nothing after </think> — fall back to think content as the answer
+		think := trimmed[len("<think>"):end]
+		return strings.TrimSpace(think)
+	}
+	return after
 }
 
 func min(a, b int) int {

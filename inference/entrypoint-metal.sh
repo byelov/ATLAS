@@ -13,12 +13,21 @@
 set -euo pipefail
 
 # ── Model ───────────────────────────────────────────────────────────────────
-# Resolve MODEL_PATH: env var > HF cache > ~/models fallback
+# Resolve MODEL_PATH: env var > HF cache (glob) > conda python > ~/models fallback
 if [[ -z "${MODEL_PATH:-}" ]]; then
-    MODEL_PATH=$(python3 -c "
+    # 1. Try direct glob in HF cache (no Python needed)
+    HF_GLOB=$(ls ~/.cache/huggingface/hub/models--unsloth--Qwen3.5-9B-GGUF/snapshots/*/Qwen3.5-9B-Q6_K.gguf 2>/dev/null | head -1)
+    if [[ -f "${HF_GLOB:-}" ]]; then
+        MODEL_PATH="$HF_GLOB"
+    else
+        # 2. Try conda atlas env python
+        CONDA_PY="${HOME}/opt/homebrew/Caskroom/miniforge/base/envs/atlas/bin/python3"
+        [[ ! -x "$CONDA_PY" ]] && CONDA_PY="/opt/homebrew/Caskroom/miniforge/base/envs/atlas/bin/python3"
+        MODEL_PATH=$("$CONDA_PY" -c "
 from huggingface_hub import hf_hub_download
 print(hf_hub_download('unsloth/Qwen3.5-9B-GGUF', 'Qwen3.5-9B-Q6_K.gguf'))
 " 2>/dev/null) || MODEL_PATH="$HOME/models/Qwen3.5-9B-Q6_K.gguf"
+    fi
 fi
 MODEL_FILE="${MODEL_PATH}"
 
@@ -89,4 +98,5 @@ exec "$LLAMA_SERVER" \
   --no-cache-prompt \
   --embeddings \
   --jinja \
+  --reasoning-format none \
   --no-warmup
