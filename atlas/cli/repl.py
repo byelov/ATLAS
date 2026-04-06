@@ -59,6 +59,19 @@ def handle_command(line: str):
             return
         solve.solve_file(filepath)
 
+    elif cmd == "/save":
+        parts2 = args.split(None, 1)
+        if len(parts2) < 2:
+            display.error("Usage: /save <output_file> <problem description>")
+            return
+        out_file, problem = parts2[0].strip(), parts2[1].strip()
+        code = solve.solve(problem, stream=True)
+        if code:
+            import pathlib
+            pathlib.Path(out_file).parent.mkdir(parents=True, exist_ok=True)
+            pathlib.Path(out_file).write_text(code)
+            display.info(f"Saved to {out_file}")
+
     elif cmd == "/bench":
         import shlex
         bench_args = shlex.split(args) if args else []

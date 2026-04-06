@@ -164,6 +164,24 @@ GEOMETRIC_LENS_ENABLED=true \
 PROJECT_DATA_DIR=/tmp/atlas-projects \
 REDIS_URL=redis://localhost:6379 \
   python -m uvicorn main:app --host 0.0.0.0 --port 8099
+
+python3 -c "
+from huggingface_hub import hf_hub_download
+import shutil, os
+
+dest = 'geometric-lens/geometric_lens/models'
+os.makedirs(dest, exist_ok=True)
+
+files = ['models/cost_field.pt', 'models/metric_tensor.pt', 'models/gx_xgboost.pkl', 'models/gx_weights.json']
+for fpath in files:
+    fname = os.path.basename(fpath)
+    try:
+        path = hf_hub_download('itigges22/ATLAS', fpath, repo_type='dataset')
+        shutil.copy(path, os.path.join(dest, fname))
+        print(f'Downloaded {fname}')
+    except Exception as e:
+        print(f'Skipped {fname}: {e}')
+"
 ```
 
 ### V3 Service

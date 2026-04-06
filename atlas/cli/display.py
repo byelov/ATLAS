@@ -266,17 +266,18 @@ def help_text():
     print(f"""
   {BOLD}Commands{RESET}
   {GRAY}{BOX_H * (tw - 4)}{RESET}
-  {CYAN}/solve{RESET} {DIM}<file>{RESET}       Solve a problem from file
-  {CYAN}/bench{RESET} {DIM}[options]{RESET}    Run benchmark
-  {CYAN}/ablation{RESET} {DIM}[opts]{RESET}    Run ablation study
-  {CYAN}/status{RESET}              Service health
-  {CYAN}/help{RESET}                This help
-  {CYAN}/quit{RESET}                Exit
+  {CYAN}/save{RESET} {DIM}<file> <problem>{RESET}  Generate and save code to file
+  {CYAN}/solve{RESET} {DIM}<file>{RESET}           Solve a problem from file
+  {CYAN}/bench{RESET} {DIM}[options]{RESET}        Run benchmark
+  {CYAN}/status{RESET}                  Service health
+  {CYAN}/help{RESET}                    This help
+  {CYAN}/quit{RESET}                    Exit
 
   {BOLD}Usage{RESET}
   {GRAY}{BOX_H * (tw - 4)}{RESET}
   Type or paste a coding problem directly.
   Pipe: {DIM}cat problem.txt | atlas{RESET}
+  Redirect: {DIM}echo "problem" | atlas > solution.py{RESET}
 """)
 
 
