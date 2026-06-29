@@ -35,10 +35,19 @@ CONDA_BASE=$(conda info --base 2>/dev/null) || error "conda not found. Run setup
 # shellcheck source=/dev/null
 source "$CONDA_BASE/etc/profile.d/conda.sh"
 conda activate atlas
+# Another auto-activated env can stay ahead of atlas on PATH; force atlas first.
+ATLAS_ENV="$CONDA_BASE/envs/atlas"
+[[ -x "$ATLAS_ENV/bin/python" ]] || error "conda env 'atlas' not found. Run setup-mac.sh first."
+export PATH="$ATLAS_ENV/bin:$PATH"
+[[ "$(command -v python)" == "$ATLAS_ENV/bin/python" ]] || error "failed to activate atlas env (python=$(command -v python))"
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 CONTEXT_LENGTH="${CONTEXT_LENGTH:-65536}"
 PARALLEL_SLOTS="${PARALLEL_SLOTS:-4}"
+# The lens couples its artifacts to a model identity; the proxy/CLI tag requests
+# with it too. Override to match a model-specific lens artifact if you retrain.
+ATLAS_MODEL_NAME="${ATLAS_MODEL_NAME:-Qwen3.5-9B-Q6_K}"
+export ATLAS_MODEL_NAME
 
 # ── Cleanup on exit ───────────────────────────────────────────────────────────
 PIDS=()
@@ -117,6 +126,7 @@ fi
 LLAMA_URL=http://localhost:8080 \
 LLAMA_EMBED_URL=http://localhost:8080 \
 GEOMETRIC_LENS_ENABLED=true \
+ATLAS_MODEL_NAME="$ATLAS_MODEL_NAME" \
 PROJECT_DATA_DIR=/tmp/atlas-projects \
 REDIS_URL=redis://localhost:6379 \
   bash -c 'cd geometric-lens && exec python -m uvicorn main:app --host 0.0.0.0 --port 8099' \
@@ -158,7 +168,11 @@ if lsof -ti :8090 &>/dev/null; then
     sleep 1
 fi
 
-"$PROXY_BIN" >"$LOG_DIR/atlas-proxy.log" 2>&1 &
+ATLAS_INFERENCE_URL=http://localhost:8080 \
+ATLAS_LENS_URL=http://localhost:8099 \
+ATLAS_SANDBOX_URL=http://localhost:8020 \
+ATLAS_MODEL_NAME="$ATLAS_MODEL_NAME" \
+  "$PROXY_BIN" >"$LOG_DIR/atlas-proxy.log" 2>&1 &
 PROXY_PID=$!
 PIDS+=("$PROXY_PID")
 echo "  PID $PROXY_PID → $LOG_DIR/atlas-proxy.log"
