@@ -1650,6 +1650,14 @@ func callLLMOnceWithGrammar(ctx *AgentContext, messages []AgentMessage, temperat
 		// incompatible with enable_thinking"). Disable explicitly.
 		"enable_thinking": false,
 	}
+	// ATLAS_GRAMMAR_MODE=gbnf: constrain the unrestricted turn with the full
+	// tool-call GBNF grammar instead of a response_format json-schema. Some
+	// llama.cpp builds (e.g. the stock Metal one) can't compile a json-schema
+	// into a sampler ("Failed to initialize samplers") but accept GBNF — this
+	// gives schema-strict tool calls there without a response_format schema.
+	if grammar == "" && strings.EqualFold(os.Getenv("ATLAS_GRAMMAR_MODE"), "gbnf") {
+		grammar = buildGBNFGrammarForTools(nil)
+	}
 	if grammar != "" {
 		// Token-level restriction wins over response_format. llama-server
 		// rejects requests that pass both response_format=json_object and
