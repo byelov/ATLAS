@@ -63,8 +63,8 @@ pip install -q huggingface_hub
 echo "  geometric-lens…"
 pip install -q -r geometric-lens/requirements.txt
 
-echo "  sandbox…"
-pip install -q fastapi uvicorn pydantic
+echo "  sandbox… (pytest + pylint: the executor shells out to them to run/score tests)"
+pip install -q fastapi uvicorn pydantic pytest pylint
 
 echo "  v3-service (torch — may take a while)…"
 pip install -q torch

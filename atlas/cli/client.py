@@ -238,6 +238,14 @@ def run_sandbox(code: str, test_code: str = "",
             "timeout": timeout_sec,
         }
         d = _post(f"{SANDBOX_URL}/execute", body, timeout=timeout_sec + 10)
-        return d.get("passed", False), d.get("stdout", ""), d.get("stderr", "")
+        # The executor reports `success` + tests_run/tests_passed (no `passed`
+        # field). Treat a run as passed when it succeeded and every test that
+        # ran passed; fall back to a legacy `passed` field if present.
+        if "passed" in d:
+            ok = bool(d["passed"])
+        else:
+            run, ok_n = d.get("tests_run", 0), d.get("tests_passed", 0)
+            ok = bool(d.get("success")) and (run == 0 or ok_n == run)
+        return ok, d.get("stdout", ""), d.get("stderr", "")
     except Exception as e:
         return False, "", str(e)

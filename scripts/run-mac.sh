@@ -173,10 +173,23 @@ if lsof -ti :8090 &>/dev/null; then
     sleep 1
 fi
 
+# ATLAS_GRAMMAR_MODE=loose: the stock Metal llama.cpp build can't compile a
+#   JSON schema into a sampler ("Failed to initialize samplers") — it accepts
+#   plain json_object and GBNF grammars but not response_format schemas. Loose
+#   mode drops the schema so the agent loop runs. (Override to "strict" if you
+#   build a llama.cpp that supports json-schema response_format.)
+# ATLAS_VERIFY_IN=host: the sandbox confines run_command to /workspace, which
+#   isn't bind-mounted to your project on native macOS, so sandboxed commands
+#   fail with "invalid cwd … not in the subpath of /workspace". Running on the
+#   host lets the agent actually execute/verify in your working dir. This means
+#   agent commands run on your machine — fine for local dev; set to "sandbox"
+#   if you don't want that.
 ATLAS_INFERENCE_URL=http://localhost:8080 \
 ATLAS_LENS_URL=http://localhost:8099 \
 ATLAS_SANDBOX_URL=http://localhost:8020 \
 ATLAS_MODEL_NAME="$ATLAS_MODEL_NAME" \
+ATLAS_GRAMMAR_MODE="${ATLAS_GRAMMAR_MODE:-loose}" \
+ATLAS_VERIFY_IN="${ATLAS_VERIFY_IN:-host}" \
   "$PROXY_BIN" >"$LOG_DIR/atlas-proxy.log" 2>&1 &
 PROXY_PID=$!
 PIDS+=("$PROXY_PID")

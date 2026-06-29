@@ -288,7 +288,34 @@ as both run the same model**.
 | `atlas lens build`: "No usable samples" | Point `--from-results` at the **`per_task/`** subfolder, and confirm failures contain code (see 4.2 gotcha). |
 | `atlas lens build`: "Need both pass and fail samples" | Your result set has only one class with code. Use a different run, or merge runs into one `--samples` file. |
 | Build pauses for ~1–2 min per sample; llama log shows `input (N tokens) is too large to process` | Embeddings must fit in **one physical batch** (`--ubatch-size`, default 4096). Samples longer than that error and the extractor stalls before skipping them. Either pre-filter long samples (drop code whose token count exceeds the ubatch size — roughly >14k chars), or raise `--ubatch-size`/`--batch-size` in `inference/entrypoint-metal.sh` to cover the longest sample (costs more memory). Pre-filtering is faster and the dropped giant solutions add little signal. |
+| Agent loop: every LLM call 400s with `Failed to initialize samplers: std::exception` | The stock Metal llama.cpp build can't compile a JSON **schema** into a sampler (it accepts plain `json_object` + GBNF grammars, not `response_format` schemas). Run the proxy with `ATLAS_GRAMMAR_MODE=loose` — `run-mac.sh` defaults to it. Tradeoff: looser tool-call constraint, so the model occasionally emits a malformed tool call and self-corrects. |
+| Agent `run_command` fails: `invalid cwd '…' is not in the subpath of '/workspace'` | The sandbox jails commands to `/workspace`, which isn't bind-mounted to your project on native macOS. Run on the host instead: `ATLAS_VERIFY_IN=host` (run-mac.sh default) or per-project `.atlas/config.toml` → `[execution]\ntarget = "host"`. Commands then run in your real working dir (on your machine). |
 | Port already in use | `run-mac.sh` kills occupants of 8080/8099/8020/8090 on startup and on exit. |
+
+---
+
+## 5a. The agent loop (`/v1/agent`)
+
+The proxy's agent endpoint runs the full **reason → write → execute → verify →
+repair** loop (this is what the TUI drives). On macOS two settings are required,
+both defaulted by `run-mac.sh`:
+
+- **`ATLAS_GRAMMAR_MODE=loose`** — the Metal llama.cpp build rejects json-schema
+  samplers (see troubleshooting). Loose mode keeps the loop running; the proper
+  fix is a llama.cpp that compiles json-schema, or routing the unrestricted turn
+  through GBNF (which this build *does* accept).
+- **`ATLAS_VERIFY_IN=host`** — lets `run_command` execute in your working dir
+  instead of the unusable `/workspace` sandbox jail. Note this runs agent
+  commands **on your machine**; set `ATLAS_VERIFY_IN=sandbox` to opt out.
+
+Quick smoke test (proxy must be up):
+
+```bash
+curl -sN http://localhost:8090/v1/agent -H 'Content-Type: application/json' \
+  -d '{"message":"Create hello.py that prints 1+1 and run it to verify.",
+       "working_dir":"/tmp/atlas-play","mode":"yolo","session_id":"smoke"}'
+# streams SSE events: tool_call write_file / run_command, lens scores, then [DONE]
+```
 
 ---
 
