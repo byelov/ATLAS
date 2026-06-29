@@ -61,7 +61,7 @@ echo "  Context: $CTX_LENGTH tokens"
 echo "  KV     : K=$KV_CACHE_K  V=$KV_CACHE_V"
 echo "  Slots  : $PARALLEL"
 echo "  Backend: Metal (GPU layers = 99, unified memory)"
-echo "  Grammar: JSON-schema constrained decoding via atlas-proxy"
+echo "  Grammar: JSON-schema constrained decoding via proxy"
 echo ""
 
 # ── CUDA differences ─────────────────────────────────────────────────────────

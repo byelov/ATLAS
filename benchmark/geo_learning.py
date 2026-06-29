@@ -8,8 +8,7 @@ import urllib.error
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-# Embedding dimension is model-dependent (5120 for Qwen3-14B,
-# 4096 for Qwen3.5-9B). Not used functionally — kept for documentation.
+# Embedding dimensionality is read from the selected model's response.
 
 
 # --- Embedding extraction -----------------------------------------------------
@@ -18,8 +17,7 @@ def extract_embedding_urllib(text: str, llama_url: str) -> Optional[List[float]]
     """
     Extract embedding from LLM server.
 
-    Supports both llama.cpp (/embedding) and Fox (/v1/embeddings) endpoints.
-    Set ATLAS_USE_FOX=1 to use Fox's OpenAI-compatible endpoint.
+    Supports llama.cpp /embedding.
 
     Args:
         text: Input text to embed.
@@ -28,20 +26,8 @@ def extract_embedding_urllib(text: str, llama_url: str) -> Optional[List[float]]
     Returns:
         List of floats, or None on failure.
     """
-    import os
-    use_fox = os.environ.get("ATLAS_USE_FOX", "0") == "1"
-
-    if use_fox:
-        # Fox: OpenAI-compatible /v1/embeddings
-        body = json.dumps({
-            "model": os.environ.get("ATLAS_MODEL_NAME", "default"),
-            "input": text,
-        }).encode("utf-8")
-        endpoint = f"{llama_url}/v1/embeddings"
-    else:
-        # llama.cpp: /embedding
-        body = json.dumps({"content": text}).encode("utf-8")
-        endpoint = f"{llama_url}/embedding"
+    body = json.dumps({"content": text}).encode("utf-8")
+    endpoint = f"{llama_url}/embedding"
 
     req = urllib.request.Request(
         endpoint,
@@ -54,35 +40,28 @@ def extract_embedding_urllib(text: str, llama_url: str) -> Optional[List[float]]
     except (urllib.error.URLError, urllib.error.HTTPError, OSError, ValueError):
         return None
 
-    if use_fox:
-        # Fox response: {"data": [{"embedding": [d0, d1, ...]}]}
-        try:
-            return data["data"][0]["embedding"]
-        except (KeyError, IndexError, TypeError):
-            return None
-    else:
-        # llama.cpp response: [{"index": 0, "embedding": [[d0, ...], ...]}]
-        try:
-            token_vectors = data[0]["embedding"]
-        except (KeyError, IndexError, TypeError):
-            return None
+    # llama.cpp response: [{"index": 0, "embedding": [[d0, ...], ...]}]
+    try:
+        token_vectors = data[0]["embedding"]
+    except (KeyError, IndexError, TypeError):
+        return None
 
-        if not token_vectors:
-            return None
+    if not token_vectors:
+        return None
 
-        if not isinstance(token_vectors[0], list):
-            return token_vectors
+    if not isinstance(token_vectors[0], list):
+        return token_vectors
 
-        n_tokens = len(token_vectors)
-        n_dims = len(token_vectors[0])
-        pooled = [0.0] * n_dims
-        for vec in token_vectors:
-            for i, v in enumerate(vec):
-                pooled[i] += v
-        for i in range(n_dims):
-            pooled[i] /= n_tokens
+    n_tokens = len(token_vectors)
+    n_dims = len(token_vectors[0])
+    pooled = [0.0] * n_dims
+    for vec in token_vectors:
+        for i, v in enumerate(vec):
+            pooled[i] += v
+    for i in range(n_dims):
+        pooled[i] /= n_tokens
 
-        return pooled
+    return pooled
 
 
 # --- Spearman rank correlation ------------------------------------------------

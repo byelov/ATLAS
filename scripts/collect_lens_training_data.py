@@ -20,12 +20,17 @@ import time
 import urllib.request
 import urllib.error
 import glob
+from typing import Optional
 
 LLAMA_URL = os.environ.get("LLAMA_URL", "http://localhost:32735")
 
 
-def extract_embedding(text: str, max_retries: int = 5) -> list:
-    """Extract embedding from llama-server with retries."""
+def extract_embedding(text: str, max_retries: int = 5) -> Optional[list]:
+    """Extract embedding from llama-server with retries.
+
+    Returns None after `max_retries` consecutive failures so the caller
+    can skip the task instead of crashing on a transient network blip.
+    """
     body = json.dumps({"content": text}).encode("utf-8")
     req = urllib.request.Request(
         f"{LLAMA_URL}/embedding",
@@ -48,6 +53,9 @@ def extract_embedding(text: str, max_retries: int = 5) -> list:
             else:
                 print(f"  FAILED after {max_retries} retries: {e}")
                 return None
+    # max_retries <= 0 falls through here; explicit return for
+    # py/mixed-returns. The caller already handles None.
+    return None
 
 
 def main():
@@ -75,7 +83,8 @@ def main():
     skipped = 0
 
     for i, f in enumerate(task_files):
-        d = json.load(open(f))
+        with open(f) as fh:
+            d = json.load(fh)
         task_id = d.get("task_id", os.path.basename(f))
         code = d.get("code", "")
         passed = d.get("passed", False)
@@ -89,7 +98,7 @@ def main():
         status = "PASS" if passed else "FAIL"
 
         # Build the same text format as score_candidate
-        task_prompt = d.get("task_prompt", "")  # might not be stored
+        d.get("task_prompt", "")  # might not be stored
         text = f"SOLUTION: {code}"
 
         print(f"  [{i+1}/{len(task_files)}] {task_id}: {status} ({len(code)} chars)...", end=" ", flush=True)

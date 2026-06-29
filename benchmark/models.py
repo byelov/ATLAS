@@ -314,8 +314,10 @@ class HardwareInfo:
     Attributes:
         gpu_model: GPU model name
         gpu_vram_gb: GPU VRAM in GB
+        gpu_vendor: GPU vendor (nvidia / amd / apple / intel / "")
         gpu_driver_version: GPU driver version
-        cuda_version: CUDA version
+        cuda_version: CUDA version (populated only for NVIDIA hosts)
+        rocm_version: ROCm version (populated only for AMD hosts)
         cpu_model: CPU model name
         cpu_cores: Number of CPU cores
         ram_gb: System RAM in GB
@@ -326,12 +328,15 @@ class HardwareInfo:
         model_name: LLM model name
         model_quantization: Model quantization type
         context_length: Context length setting
-        power_draw_watts: Current GPU power draw
+        power_draw_watts: Current GPU power draw (NVIDIA only — rocm-smi
+                          power reporting varies wildly by card)
     """
     gpu_model: str = ""
     gpu_vram_gb: float = 0.0
+    gpu_vendor: str = ""
     gpu_driver_version: str = ""
     cuda_version: str = ""
+    rocm_version: str = ""
     cpu_model: str = ""
     cpu_cores: int = 0
     ram_gb: float = 0.0
@@ -349,8 +354,10 @@ class HardwareInfo:
         return {
             "gpu_model": self.gpu_model,
             "gpu_vram_gb": self.gpu_vram_gb,
+            "gpu_vendor": self.gpu_vendor,
             "gpu_driver_version": self.gpu_driver_version,
             "cuda_version": self.cuda_version,
+            "rocm_version": self.rocm_version,
             "cpu_model": self.cpu_model,
             "cpu_cores": self.cpu_cores,
             "ram_gb": self.ram_gb,

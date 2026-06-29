@@ -20,6 +20,7 @@ PROMPT="Write a Python function that implements binary search on a sorted array 
 K_VALUES=(1 3 5 10)
 TEMPS=(0.0 0.6 0.8)
 N_PREDICT=200
+MODEL_NAME="${ATLAS_MODEL_NAME:-local-model}"
 
 echo "=== Best-of-K Latency Measurement ==="
 echo "Timestamp: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -43,7 +44,7 @@ echo "Sending identical prompt twice to check cache_prompt behavior..."
 FIRST=$(curl -sf "$API_URL" \
     -H "Content-Type: application/json" \
     -d "{
-        \"model\": \"qwen3-14b\",
+        \"model\": \"$MODEL_NAME\",
         \"messages\": [{\"role\": \"user\", \"content\": \"$PROMPT\"}],
         \"max_tokens\": 50,
         \"temperature\": 0.0,
@@ -57,7 +58,7 @@ echo "  First request (cold): ${FIRST_TIME}s"
 SECOND=$(curl -sf "$API_URL" \
     -H "Content-Type: application/json" \
     -d "{
-        \"model\": \"qwen3-14b\",
+        \"model\": \"$MODEL_NAME\",
         \"messages\": [{\"role\": \"user\", \"content\": \"$PROMPT\"}],
         \"max_tokens\": 50,
         \"temperature\": 0.6,
@@ -90,7 +91,7 @@ for k in "${K_VALUES[@]}"; do
             RESP=$(curl -sf "$API_URL" \
                 -H "Content-Type: application/json" \
                 -d "{
-                    \"model\": \"qwen3-14b\",
+                    \"model\": \"$MODEL_NAME\",
                     \"messages\": [{\"role\": \"user\", \"content\": \"$PROMPT\"}],
                     \"max_tokens\": $N_PREDICT,
                     \"temperature\": $temp,

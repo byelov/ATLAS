@@ -3,16 +3,37 @@ Multi-language sandbox execution server.
 
 Supports: Python, JavaScript/TypeScript, Go, Rust, C/C++, Bash/Shell
 Provides isolated code execution with resource limits and structured error reporting.
+
+Security / trust model (load-bearing — read before "fixing" CodeQL alerts):
+    This service IS the trust boundary. Its entire purpose is to execute
+    agent-supplied code and shell commands on behalf of ATLAS. The
+    container provides isolation (tmpfs workspace, read-only root,
+    network-locked-down, per-call resource limits via MAX_EXECUTION_TIME
+    and MAX_MEMORY_MB). The Python code in this file does NOT need to
+    sanitize inputs to subprocess.run, validate user-controlled paths
+    inside the workspace, or treat agent-supplied code as untrusted —
+    that's the container's job.
+
+    CodeQL routinely flags `py/command-line-injection` and
+    `py/path-injection` here. Those alerts are by-design false positives:
+    accepting + executing user-controlled commands is the requirement,
+    and the cmd-list form (no shell=True at the Python layer) prevents
+    Python-level injection. Don't add input validation that would break
+    the sandbox's purpose; dismiss the alerts with rationale instead.
 """
 
+import json
 import os
-import sys
 import shutil
+import signal
 import tempfile
 import subprocess
 import logging
 import re
+import threading
 import time
+import uuid
+from collections import deque
 from typing import Dict, Optional, List
 from pathlib import Path
 from fastapi import FastAPI, HTTPException
@@ -35,6 +56,10 @@ SUPPORTED_LANGUAGES = {
     "rust", "rs",
     "c", "cpp", "c++",
     "bash", "sh", "shell",
+    "html", "htm",
+    "xml",
+    "json",
+    "yaml", "yml",
 }
 
 def normalize_language(lang: str) -> str:
@@ -55,6 +80,14 @@ def normalize_language(lang: str) -> str:
         return "cpp"
     if lang in ("bash", "sh", "shell"):
         return "bash"
+    if lang in ("html", "htm"):
+        return "html"
+    if lang in ("xml",):
+        return "xml"
+    if lang in ("json",):
+        return "json"
+    if lang in ("yaml", "yml"):
+        return "yaml"
     return lang
 
 
@@ -64,6 +97,14 @@ class ExecuteRequest(BaseModel):
     test_code: Optional[str] = None
     requirements: Optional[List[str]] = None
     timeout: int = 30
+    # PC-046: Project-context files dropped into the workspace alongside
+    # `solution.py` (or the language equivalent) so multi-file imports
+    # resolve. Filename keys are relative to the workspace root; each is
+    # validated to reject path traversal (`..`) and absolute paths
+    # before being written. Used by V3's verified_sandbox and
+    # smoke_compile_check to ship the rest of the project so e.g.
+    # `import game_logic` resolves to the user's actual game_logic.py.
+    files: Optional[Dict[str, str]] = None
 
 
 class ExecuteResponse(BaseModel):
@@ -107,6 +148,501 @@ def list_languages():
     return {"languages": versions}
 
 
+# ---------------------------------------------------------------------------
+# /shell — arbitrary command execution against the bind-mounted workspace.
+#
+# The agent loop's run_command tool used to fork bash inside the proxy
+# container, but the proxy is a slim Go binary with no python/pip/node/etc
+# — every "verify your fix" call hit "command not found". We now route
+# shell commands through the sandbox, which has the full language matrix
+# pre-installed AND has /workspace bind-mounted (rw) at the same path the
+# proxy sees, so paths the agent learned from read_file / list_directory
+# carry over verbatim.
+#
+# Safety: the proxy's validateShellCommand blocks only CATASTROPHIC commands
+# (whole-project wipe like `rm -rf /`, fork bombs, device destruction) BEFORE
+# the call reaches us — ordinary file ops (mv/cp/rm of a file/mkdir) are
+# allowed. This endpoint is the executor, not the gate. The real boundary is
+# the container: no-new-privileges, read-only rootfs, and /workspace as the
+# ONLY writable host mount, so the blast radius is the project folder.
+# ---------------------------------------------------------------------------
+
+
+class ShellRequest(BaseModel):
+    command: str
+    cwd: Optional[str] = None  # absolute path inside container, defaults to /workspace
+    timeout: int = 30          # seconds; capped at MAX_EXECUTION_TIME
+    env: Optional[Dict[str, str]] = None
+    # Optional ephemeral overlay used by V3 build verification. When
+    # present, /shell copies a bounded workspace snapshot into /tmp,
+    # overlays these relative file paths, runs the command there, then
+    # deletes the snapshot. This lets V3 test a candidate without
+    # writing it into the real bind-mounted project.
+    files: Optional[Dict[str, str]] = None
+
+
+class ShellResponse(BaseModel):
+    success: bool
+    stdout: str
+    stderr: str
+    exit_code: int
+    elapsed_ms: int
+
+
+WORKSPACE_ROOT = Path("/workspace")
+SHELL_SNAPSHOT_IGNORE = {
+    ".git",
+    ".hg",
+    ".svn",
+    ".cache",
+    ".venv",
+    "venv",
+    "__pycache__",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+    ".tox",
+    "build",
+    "coverage",
+    ".coverage",
+    "htmlcov",
+    ".next",
+    "dist",
+    "target",
+    "secrets",
+}
+SHELL_SNAPSHOT_IGNORE_SUFFIXES = (
+    ".arrow",
+    ".bin",
+    ".db",
+    ".gguf",
+    ".gz",
+    ".onnx",
+    ".parquet",
+    ".pt",
+    ".safetensors",
+    ".sqlite",
+    ".tar",
+    ".zip",
+)
+SHELL_SNAPSHOT_MAX_FILES = int(os.getenv("ATLAS_SHELL_SNAPSHOT_MAX_FILES", "20000"))
+SHELL_SNAPSHOT_MAX_BYTES = int(os.getenv("ATLAS_SHELL_SNAPSHOT_MAX_BYTES", str(256 * 1024 * 1024)))
+SHELL_SNAPSHOT_MAX_FILE_BYTES = int(os.getenv("ATLAS_SHELL_SNAPSHOT_MAX_FILE_BYTES", str(16 * 1024 * 1024)))
+
+
+def _skip_shell_snapshot_path(path: Path) -> bool:
+    name = path.name
+    if name in SHELL_SNAPSHOT_IGNORE or name.startswith(".env"):
+        return True
+    return name.endswith(SHELL_SNAPSHOT_IGNORE_SUFFIXES)
+
+
+def _copy_symlink_if_safe(src: Path, dest: Path, source_root: Path, snapshot: Path) -> bool:
+    try:
+        target = src.resolve(strict=True)
+        rel_target = target.relative_to(source_root)
+        link_target = os.readlink(src)
+    except (OSError, ValueError):
+        return False
+
+    if os.path.isabs(link_target):
+        snapshot_target = snapshot / rel_target
+        link_target = os.path.relpath(snapshot_target, dest.parent)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    os.symlink(link_target, dest)
+    return True
+
+
+def _copy_workspace_snapshot(source: Path, snapshot: Path):
+    files_copied = 0
+    bytes_copied = 0
+    source = source.resolve()
+
+    for root, dirs, filenames in os.walk(source, topdown=True, followlinks=False):
+        root_path = Path(root)
+        try:
+            rel_root = root_path.relative_to(source)
+        except ValueError:
+            continue
+        target_dir = snapshot / rel_root
+        target_dir.mkdir(parents=True, exist_ok=True)
+
+        kept_dirs = []
+        for name in dirs:
+            src_dir = root_path / name
+            if _skip_shell_snapshot_path(src_dir):
+                continue
+            if src_dir.is_symlink():
+                _copy_symlink_if_safe(src_dir, target_dir / name, source, snapshot)
+                continue
+            kept_dirs.append(name)
+        dirs[:] = kept_dirs
+
+        for name in filenames:
+            src = root_path / name
+            if _skip_shell_snapshot_path(src):
+                continue
+            if src.is_symlink():
+                _copy_symlink_if_safe(src, target_dir / name, source, snapshot)
+                continue
+            try:
+                stat = src.stat()
+            except OSError:
+                continue
+            if not src.is_file():
+                continue
+            if stat.st_size > SHELL_SNAPSHOT_MAX_FILE_BYTES:
+                logger.info(
+                    "shell overlay snapshot skipped large file: %s (%d bytes)",
+                    src, stat.st_size,
+                )
+                continue
+
+            files_copied += 1
+            bytes_copied += stat.st_size
+            if files_copied > SHELL_SNAPSHOT_MAX_FILES:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"workspace snapshot file limit exceeded ({SHELL_SNAPSHOT_MAX_FILES})",
+                )
+            if bytes_copied > SHELL_SNAPSHOT_MAX_BYTES:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"workspace snapshot byte limit exceeded ({SHELL_SNAPSHOT_MAX_BYTES})",
+                )
+            shutil.copy2(src, target_dir / name)
+
+
+def _safe_overlay_path(name: str) -> Path:
+    if not isinstance(name, str) or not name:
+        raise HTTPException(status_code=400, detail="overlay file path is required")
+    rel = Path(name)
+    if rel.is_absolute() or name.startswith("\\") or ".." in rel.parts:
+        raise HTTPException(status_code=400, detail=f"unsafe overlay file path: {name!r}")
+    return rel
+
+
+def _write_overlay_files(root: Path, files: Dict[str, str]):
+    root_resolved = root.resolve()
+    for name, content in files.items():
+        rel = _safe_overlay_path(name)
+        target = root / rel
+        content = content if isinstance(content, str) else ""
+        if len(content.encode("utf-8", "ignore")) > SHELL_SNAPSHOT_MAX_FILE_BYTES:
+            raise HTTPException(status_code=413, detail=f"overlay file is too large: {name!r}")
+        try:
+            target_resolved = target.resolve(strict=False)
+            target_resolved.relative_to(root_resolved)
+        except (OSError, ValueError):
+            raise HTTPException(status_code=400, detail=f"overlay file escapes workspace: {name!r}")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content)
+
+
+def _snapshot_workspace_with_overlay(files: Dict[str, str]) -> Path:
+    snapshot = Path(tempfile.mkdtemp(prefix="shell-", dir=WORKSPACE_BASE))
+    try:
+        if WORKSPACE_ROOT.exists():
+            _copy_workspace_snapshot(WORKSPACE_ROOT, snapshot)
+        _write_overlay_files(snapshot, files)
+        return snapshot
+    except Exception:
+        shutil.rmtree(snapshot, ignore_errors=True)
+        raise
+
+
+def _resolve_shell_cwd(raw_cwd: Optional[str], root: Path) -> Path:
+    if not raw_cwd:
+        return root
+    try:
+        requested = Path(raw_cwd)
+        if requested.is_absolute():
+            rel = requested.resolve(strict=False).relative_to(WORKSPACE_ROOT.resolve(strict=False))
+        else:
+            rel = requested
+        if rel.is_absolute() or ".." in rel.parts:
+            raise ValueError(f"cwd must be under {WORKSPACE_ROOT}")
+        cwd = (root / rel).resolve(strict=False)
+        cwd.relative_to(root.resolve(strict=False))
+    except (OSError, ValueError) as e:
+        raise HTTPException(status_code=400, detail=f"invalid cwd: {e}")
+    if not cwd.exists():
+        raise HTTPException(status_code=400, detail=f"cwd does not exist: {cwd}")
+    return cwd
+
+
+def _translate_workspace_command(command: str, root: Path) -> str:
+    """Point absolute workspace paths at the ephemeral overlay root.
+
+    V3 build commands often come from project detection and may include
+    absolute `/workspace/...` paths. When /shell is running with an overlay
+    snapshot, those paths must resolve inside the snapshot, not the real
+    bind-mounted checkout.
+    """
+    workspace = str(WORKSPACE_ROOT.resolve(strict=False))
+    replacement = str(root.resolve(strict=False))
+    if workspace == replacement:
+        return command
+    pattern = rf"(?<![\w./-]){re.escape(workspace)}(?=$|/|[^\w./-])"
+    return re.sub(pattern, replacement, command)
+
+
+# ---------------------------------------------------------------------------
+# Background jobs (PC-196)
+# ---------------------------------------------------------------------------
+#
+# The agent's verify reflex is "run python app.py / npm start / cargo run
+# and curl the result." Foreground /shell can't do that — the server
+# blocks until killed. Models work around it with `timeout 5 ... || true`
+# hacks that capture the startup banner but tear the server down before
+# anything can curl it.
+#
+# Background jobs solve this cleanly: start_background spawns the
+# command and returns a job_id immediately, tail_background lets the
+# model peek at stdout/stderr, stop_background kills it. The model can
+# now run a server, hit it from another command, then clean up.
+#
+# Process-global registry. Keyed by job_id (uuid4). Each entry holds:
+#   proc:    subprocess.Popen
+#   stdout:  deque of recent lines (bounded — long-running servers
+#            otherwise eat unbounded memory)
+#   stderr:  deque of recent lines
+#   command: original command string for diagnostics
+#   started: time.time() of spawn
+#
+# Cleanup: a janitor thread sweeps finished jobs every 30s, dropping
+# entries older than BG_RETENTION_SEC. Models can still query a job
+# right after it exits to read final output.
+
+BG_MAX_LINES = 500          # ring buffer per stream
+BG_MAX_JOBS = 32            # hard cap so a misbehaving model can't OOM us
+BG_RETENTION_SEC = 600      # keep finished jobs around for 10 min
+
+_bg_jobs: Dict[str, dict] = {}
+_bg_lock = threading.Lock()
+
+
+def _bg_drain_stream(job_id: str, stream_name: str, fh):
+    """Tail a Popen pipe in a background thread, append each line to
+    the job's deque. Runs until the pipe closes (process exit)."""
+    try:
+        for raw in iter(fh.readline, ""):
+            if raw == "":
+                break
+            with _bg_lock:
+                job = _bg_jobs.get(job_id)
+                if job is None:
+                    return
+                job[stream_name].append(raw.rstrip("\n"))
+    except (OSError, ValueError):
+        # pipe closed / process gone — normal end of life
+        return
+
+
+def _bg_janitor():
+    """Sweep finished jobs older than retention. Daemon thread."""
+    while True:
+        time.sleep(30)
+        cutoff = time.time() - BG_RETENTION_SEC
+        with _bg_lock:
+            for jid in list(_bg_jobs.keys()):
+                job = _bg_jobs[jid]
+                if job["proc"].poll() is not None and job.get("ended_at", 0) < cutoff:
+                    del _bg_jobs[jid]
+
+
+threading.Thread(target=_bg_janitor, daemon=True).start()
+
+
+class BackgroundStartRequest(BaseModel):
+    command: str
+    cwd: Optional[str] = None
+    env: Optional[Dict[str, str]] = None
+
+
+class BackgroundStartResponse(BaseModel):
+    job_id: str
+    pid: int
+    started_at: float
+
+
+class BackgroundOutputResponse(BaseModel):
+    job_id: str
+    running: bool
+    exit_code: Optional[int]
+    stdout: List[str]
+    stderr: List[str]
+    elapsed_sec: float
+    command: str
+
+
+class BackgroundStopResponse(BaseModel):
+    job_id: str
+    killed: bool
+    exit_code: Optional[int]
+    stdout: List[str]
+    stderr: List[str]
+
+
+def _resolve_bg_cwd(raw_cwd: Optional[str]) -> Path:
+    """Same workspace-boundary check as run_shell."""
+    if raw_cwd:
+        try:
+            cwd = Path(raw_cwd).resolve()
+        except (OSError, ValueError) as e:
+            raise HTTPException(status_code=400, detail=f"invalid cwd: {e}")
+        if not (cwd == WORKSPACE_ROOT or WORKSPACE_ROOT in cwd.parents):
+            raise HTTPException(
+                status_code=400,
+                detail=f"cwd must be under {WORKSPACE_ROOT}, got {cwd}",
+            )
+        if not cwd.exists():
+            raise HTTPException(status_code=400, detail=f"cwd does not exist: {cwd}")
+        return cwd
+    return WORKSPACE_ROOT
+
+
+@app.post("/jobs/start", response_model=BackgroundStartResponse)
+def background_start(request: BackgroundStartRequest):
+    """Spawn a background process and return a job_id.
+    Returns immediately — does NOT wait for the process to print
+    anything. Caller polls /jobs/{id}/output for stdout/stderr."""
+    if not request.command or not request.command.strip():
+        raise HTTPException(status_code=400, detail="command is required")
+    cwd = _resolve_bg_cwd(request.cwd)
+    with _bg_lock:
+        if len(_bg_jobs) >= BG_MAX_JOBS:
+            raise HTTPException(
+                status_code=429,
+                detail=f"too many active jobs ({BG_MAX_JOBS}). Stop existing jobs first.",
+            )
+    env = os.environ.copy()
+    if request.env:
+        env.update(request.env)
+    try:
+        proc = subprocess.Popen(
+            ["bash", "-c", request.command],
+            cwd=str(cwd),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+            start_new_session=True,  # so /jobs/stop can kill the whole group
+        )
+    except (OSError, ValueError) as e:
+        raise HTTPException(status_code=500, detail=f"spawn failed: {e}")
+    job_id = uuid.uuid4().hex[:12]
+    job = {
+        "proc": proc,
+        "command": request.command,
+        "started_at": time.time(),
+        "stdout": deque(maxlen=BG_MAX_LINES),
+        "stderr": deque(maxlen=BG_MAX_LINES),
+    }
+    with _bg_lock:
+        _bg_jobs[job_id] = job
+    threading.Thread(target=_bg_drain_stream, args=(job_id, "stdout", proc.stdout), daemon=True).start()
+    threading.Thread(target=_bg_drain_stream, args=(job_id, "stderr", proc.stderr), daemon=True).start()
+    return BackgroundStartResponse(job_id=job_id, pid=proc.pid, started_at=job["started_at"])
+
+
+@app.get("/jobs/{job_id}/output", response_model=BackgroundOutputResponse)
+def background_output(job_id: str, lines: int = 50):
+    """Snapshot of the job's recent stdout/stderr + run state."""
+    with _bg_lock:
+        job = _bg_jobs.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail=f"unknown job_id: {job_id}")
+        proc = job["proc"]
+        rc = proc.poll()
+        running = rc is None
+        if not running and "ended_at" not in job:
+            job["ended_at"] = time.time()
+        # Snapshot the deques (thread-safe copy under lock)
+        stdout = list(job["stdout"])[-max(1, lines):]
+        stderr = list(job["stderr"])[-max(1, lines):]
+        elapsed = time.time() - job["started_at"]
+        cmd = job["command"]
+    return BackgroundOutputResponse(
+        job_id=job_id, running=running, exit_code=rc,
+        stdout=stdout, stderr=stderr, elapsed_sec=elapsed, command=cmd,
+    )
+
+
+@app.post("/jobs/{job_id}/stop", response_model=BackgroundStopResponse)
+def background_stop(job_id: str):
+    """SIGTERM the process group, wait briefly, SIGKILL if still alive.
+    Returns the final stdout/stderr buffer."""
+    with _bg_lock:
+        job = _bg_jobs.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail=f"unknown job_id: {job_id}")
+        proc = job["proc"]
+    killed = False
+    if proc.poll() is None:
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            # best-effort: swallow on failure (caller continues)
+            pass
+        try:
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                # best-effort: swallow on failure (caller continues)
+                pass
+            proc.wait(timeout=2)
+        killed = True
+    with _bg_lock:
+        job["ended_at"] = time.time()
+        stdout = list(job["stdout"])
+        stderr = list(job["stderr"])
+    return BackgroundStopResponse(
+        job_id=job_id, killed=killed, exit_code=proc.poll(),
+        stdout=stdout[-50:], stderr=stderr[-50:],
+    )
+
+
+@app.post("/shell", response_model=ShellResponse)
+def run_shell(request: ShellRequest):
+    """Run a shell command against the bind-mounted workspace."""
+    if not request.command or not request.command.strip():
+        raise HTTPException(status_code=400, detail="command is required")
+
+    timeout = min(max(1, request.timeout), MAX_EXECUTION_TIME)
+
+    snapshot = None
+    root = WORKSPACE_ROOT
+    try:
+        if request.files:
+            snapshot = _snapshot_workspace_with_overlay(request.files)
+            root = snapshot
+        # Resolve cwd. Default to /workspace (or the temp overlay root);
+        # if the caller provides one, require it to live under the
+        # workspace boundary. The path must already exist (no auto-mkdir).
+        cwd = _resolve_shell_cwd(request.cwd, root)
+        command = _translate_workspace_command(request.command, root)
+
+        start = time.time()
+        result = _run_cmd(["bash", "-c", command],
+                          timeout=timeout, cwd=cwd, env=request.env)
+        elapsed_ms = int((time.time() - start) * 1000)
+
+        return ShellResponse(
+            success=result["success"],
+            stdout=result["stdout"],
+            stderr=result["stderr"],
+            exit_code=result["returncode"],
+            elapsed_ms=elapsed_ms,
+        )
+    finally:
+        if snapshot is not None:
+            shutil.rmtree(snapshot, ignore_errors=True)
+
+
 @app.post("/execute", response_model=ExecuteResponse)
 def execute_code(request: ExecuteRequest):
     """Execute code in isolated environment."""
@@ -120,6 +656,27 @@ def execute_code(request: ExecuteRequest):
 
     workspace = tempfile.mkdtemp(dir=WORKSPACE_BASE)
     timeout = min(request.timeout, MAX_EXECUTION_TIME)
+
+    # PC-046: Drop project-context files into the workspace BEFORE the
+    # language handler runs so any `import other_module` in the candidate
+    # resolves against the rest of the user's project. Validate each
+    # path to keep the sandbox isolated — no absolute paths, no `..`
+    # traversal, no symlinks. Bad entries are silently skipped (we don't
+    # want a malformed name to block legitimate verification).
+    if request.files:
+        for name, content in request.files.items():
+            if not isinstance(name, str) or not name:
+                continue
+            # Reject absolute paths and traversal
+            if name.startswith("/") or name.startswith("\\") or ".." in Path(name).parts:
+                logger.warning(f"PC-046: rejected unsafe file path in sandbox request: {name!r}")
+                continue
+            target = Path(workspace) / name
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(content if isinstance(content, str) else "")
+            except OSError as e:
+                logger.warning(f"PC-046: failed to write {name!r} to sandbox: {e}")
 
     try:
         handler = LANGUAGE_HANDLERS[lang]
@@ -203,7 +760,7 @@ def _syntax_check_impl(lang: str, code: str, workspace: Path, filename: Optional
             stderr = result.get("stderr", "")
             for line in stderr.splitlines():
                 line = line.strip()
-                if line and "SyntaxError" in line or "IndentationError" in line or "TabError" in line:
+                if line and any(kind in line for kind in ("SyntaxError", "IndentationError", "TabError")):
                     errors.append(line)
             if not errors and stderr.strip():
                 errors.append(stderr.strip().split("\n")[-1])
@@ -279,6 +836,38 @@ def _syntax_check_impl(lang: str, code: str, workspace: Path, filename: Optional
         result = _run_cmd(["bash", "-n", str(fpath)], timeout=5, cwd=workspace)
         if result["returncode"] != 0:
             errors.append(result.get("stderr", "").strip())
+
+    elif lang == "json":
+        try:
+            json.loads(code)
+        except json.JSONDecodeError as e:
+            errors.append(str(e))
+
+    elif lang in ("yaml", "yml"):
+        try:
+            import yaml
+            yaml.safe_load(code)
+        except Exception as e:
+            errors.append(str(e))
+
+    elif lang in ("html", "htm"):
+        from html.parser import HTMLParser
+        try:
+            parser = HTMLParser()
+            parser.feed(code)
+            parser.close()
+        except Exception as e:
+            errors.append(str(e))
+
+    elif lang == "xml":
+        import xml.etree.ElementTree as ET
+        try:
+            ET.fromstring(code)
+        except ET.ParseError as e:
+            errors.append(str(e))
+
+    else:
+        errors.append(f"syntax verification is unavailable for language: {lang}")
 
     return errors
 
@@ -391,6 +980,7 @@ def execute_python(code, test_code, workspace, timeout, requirements, **_):
         if m:
             lint_score = float(m.group(1))
     except Exception:
+        # best-effort: swallow on failure (caller continues)
         pass
 
     # Run

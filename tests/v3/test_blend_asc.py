@@ -1,8 +1,6 @@
 """Tests for V3 Blend-ASC (Feature 2A) — Adaptive Sampling Budget."""
 
 import json
-import math
-from pathlib import Path
 
 import pytest
 
@@ -351,6 +349,17 @@ class TestBlendASCClass:
 # ---------------------------------------------------------------------------
 
 class TestEnergyNormalization:
+
+    def test_allocate_prefers_selected_models_normalized_energy(self,
+                                                                asc_enabled):
+        # The raw value would map to the historical easy bucket. A calibrated
+        # value from the selected model must take precedence.
+        k, tier = asc_enabled.allocate(
+            raw_energy=1.0,
+            normalized_energy=0.35,
+        )
+        assert k == 8
+        assert tier == "extreme"
 
     def test_pass_energy_is_easy(self):
         """V2 measured PASS mean = 5.00 → should normalize below 0.10."""

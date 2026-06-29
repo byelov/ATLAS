@@ -158,10 +158,10 @@ pip install torch
 
 ---
 
-## Step 6 — Build atlas-proxy (Go)
+## Step 6 — Build the proxy (Go)
 
 ```bash
-cd atlas-proxy
+cd proxy
 go build -o ~/.local/bin/atlas-proxy .
 cd ..
 ```

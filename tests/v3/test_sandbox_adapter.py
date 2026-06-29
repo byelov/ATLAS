@@ -1,9 +1,7 @@
 # tests/v3/test_sandbox_adapter.py
 """Tests for V3 SandboxAdapter dual mode (real tests vs self-verify)."""
 
-import pytest
 
-from benchmark.v3.self_test_gen import GeneratedTestCase
 
 
 # We can't import SandboxAdapter directly because it depends on BenchmarkTask

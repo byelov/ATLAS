@@ -1,0 +1,114 @@
+// PC-062: Bubbletea TUI for ATLAS — main entry point.
+//
+// Connects to atlas-proxy /events (typed envelope SSE stream from
+// PC-061) and renders the canonical chat UI: pipeline progress, event
+// log, stats + chat input. The default `atlas` command launches this
+// in interactive mode; pipe mode falls back to the built-in REPL.
+//
+// Bubbletea model is in model.go; pane rendering in panes.go;
+// chat/agent client in chat.go; SSE consumer in consumer.go.
+
+package main
+
+import (
+	"context"
+	"flag"
+	"fmt"
+	"os"
+
+	tea "github.com/charmbracelet/bubbletea"
+)
+
+const (
+	defaultProxyURL = "http://localhost:8090"
+)
+
+func main() {
+	proxyURL := flag.String("proxy", envOr("ATLAS_PROXY_URL", defaultProxyURL),
+		"atlas-proxy base URL (default: $ATLAS_PROXY_URL or http://localhost:8090)")
+	logPath := flag.String("log", envOr("ATLAS_TUI_LOG", ""),
+		"append-only debug log path (default: off; alt-screen makes copy hard, "+
+			"so tail this file to see what the TUI saw)")
+	mouseFlag := flag.String("mouse", envOr("ATLAS_TUI_MOUSE", "on"),
+		"mouse capture: 'on' (wheel scrolls chat) or 'off' (lets you select/copy text). "+
+			"Mid-session toggle: /mouse on|off")
+	demoMode := flag.String("demo", "",
+		"launch the split-pane recording demo directly (short|medium|long). "+
+			"Skips the main TUI; same as typing /demo from inside it.")
+	flag.Parse()
+
+	// Cold-start --demo bypasses the main TUI entirely.
+	if *demoMode != "" {
+		cwd, _ := os.Getwd()
+		if err := runDemo(*proxyURL, cwd, *demoMode); err != nil {
+			fmt.Fprintf(os.Stderr, "atlas-tui demo: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	if closer, err := initDebugLog(*logPath); err != nil {
+		fmt.Fprintf(os.Stderr, "atlas-tui: %v\n", err)
+		os.Exit(1)
+	} else if closer != nil {
+		defer closer()
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	model := newTUIModel(*proxyURL)
+
+	// Surface the Python wrapper's startup warning (workspace mismatch
+	// etc.) inside the TUI. Without this the warning prints to stderr
+	// and is immediately covered by alt-screen.
+	if note := os.Getenv("ATLAS_TUI_STARTUP_NOTE"); note != "" {
+		model.chat = append(model.chat, chatMessage{
+			Role: roleSystem, Meta: "startup", Body: note,
+		})
+	}
+
+	// SSE consumer goroutine: pushes envelopes onto a channel that
+	// the Bubbletea program drains via a tea.Cmd.
+	go streamEventsWithReconnect(ctx, *proxyURL+"/events", model.events)
+
+	// Mouse cell-motion capture so the wheel scrolls the chat pane.
+	// Cell-motion (vs all-motion) only captures when buttons are held
+	// or pressed, which keeps idle text selection working on most
+	// modern terminals. iTerm2/Kitty/WezTerm let users hold Option/
+	// Shift while dragging to override capture entirely; that's the
+	// recommended escape hatch when copy/paste is needed.
+	//
+	// --mouse off (or ATLAS_TUI_MOUSE=off) skips the WithMouseCellMotion
+	// option entirely so users who prefer to select/copy without holding
+	// modifiers can launch the TUI with capture pre-disabled. The
+	// /mouse slash command still toggles either way at runtime.
+	opts := []tea.ProgramOption{tea.WithAltScreen()}
+	if *mouseFlag != "off" {
+		opts = append(opts, tea.WithMouseCellMotion())
+	}
+	prog := tea.NewProgram(model, opts...)
+
+	finalModel, err := prog.Run()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "atlas-tui: %v\n", err)
+		os.Exit(1)
+	}
+
+	// /demo handoff: the slash command sets launchDemoLength on the
+	// model and quits; we now relaunch in the same terminal.
+	if fm, ok := finalModel.(tuiModel); ok && fm.launchDemoLength != "" {
+		cwd, _ := os.Getwd()
+		if err := runDemo(*proxyURL, cwd, fm.launchDemoLength); err != nil {
+			fmt.Fprintf(os.Stderr, "atlas-tui demo: %v\n", err)
+			os.Exit(1)
+		}
+	}
+}
+
+func envOr(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
+}

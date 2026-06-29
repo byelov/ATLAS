@@ -1,0 +1,229 @@
+name: tests
+
+# Runs on every push to main/dev and every PR. All jobs run on the free
+# ubuntu-latest runner — no GPU, no large model downloads, no real
+# Docker compose stack. The install-test.yml workflow handles the
+# distro-matrix bootstrap dry-run; this file is for code-level checks
+# (Go test, Python pytest, shellcheck, compose validate).
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
+
+# Cancel in-flight runs on the same ref when a newer commit lands —
+# saves runner minutes on rapid-fire pushes.
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  go-tests:
+    name: go test (${{ matrix.module }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        module: [proxy, tui]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          # 1.24 floor for proxy. tui requires 1.26+ via go.mod, but
+          # GOTOOLCHAIN=auto (1.21+ default) auto-fetches the newer
+          # toolchain when needed — same path as a real install.
+          go-version: '1.24'
+          cache-dependency-path: ${{ matrix.module }}/go.sum
+
+      - name: go test -race
+        run: python scripts/production-readiness.py --only go-${{ matrix.module }}-test
+
+      - name: go vet
+        run: python scripts/production-readiness.py --only go-${{ matrix.module }}-vet
+
+  python-tests:
+    name: pytest (${{ matrix.subset }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # tests/v3/, tests/v3-service/, and tests/cli/ are pure unit tests —
+        # no services needed. tests/integration/ + tests/infrastructure/
+        # require a live llama-server / sandbox / lens, gated separately by
+        # the integration workflow (not yet wired up — PC-064).
+        subset:
+          - tests/v3
+          - tests/v3-service
+          - tests/cli
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+          pip install pytest
+          # tree-sitter grammars for the #39 call-graph extraction tests under
+          # tests/v3-service/ (they skip cleanly if absent, but CI should run
+          # them). Pre-built wheels, no build toolchain needed.
+          pip install tree_sitter tree_sitter_python tree_sitter_javascript
+
+      - name: install sandbox runtime dependencies
+        if: matrix.subset == 'tests/v3-service'
+        run: pip install -r sandbox/requirements-runtime.txt
+
+      - name: pytest
+        run: python scripts/production-readiness.py --only python-tests --pytest-path "${{ matrix.subset }}"
+
+  ruff:
+    name: ruff (python lint)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: ruff check
+        # --select F is Pyflakes — real-bug rules (undefined names, redefined
+        # symbols, local-before-assign, string-format errors). The three
+        # codes ignored are pure style noise we don't gate on:
+        #   F401 unused-import   F541 empty-f-string   F841 unused-variable
+        # Bug-catchers like F821 (undefined name) and F823 (local var
+        # referenced before assignment) stay on. Tighten later by removing
+        # entries from --ignore as the codebase gets cleaner.
+        run: |
+          pip install ruff
+          python scripts/production-readiness.py --only ruff
+
+  shellcheck:
+    name: shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install shellcheck
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+
+      - name: shellcheck
+        # --severity=error catches real bugs (unquoted vars in dangerous
+        # contexts, misuse of [[ ]], etc) without bikeshedding on style.
+        # Bump to `warning` later once the scripts are stable.
+        run: python scripts/production-readiness.py --only shellcheck
+
+  compose-validate:
+    name: docker compose config
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: validate compose YAML
+        # The runner has docker compose v2 pre-installed. `config -q`
+        # parses + validates docker-compose.yml without pulling images.
+        # Set dummy env so vars don't fail the parse.
+        run: python scripts/production-readiness.py --only compose
+
+  yamllint:
+    name: yamllint (workflows)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: yamllint
+        run: |
+          pip install yamllint
+          python scripts/production-readiness.py --only workflow-yaml
+
+  llama-patches-apply:
+    # Smoke test: verifies the PC-202 hidden-states + spec-decode
+    # patches still apply cleanly against the pinned LLAMA_CPP_REV.
+    # Added after 2026-05-20 build failure where upstream llama.cpp
+    # drift shifted server-context.cpp by 1 line and broke the patch
+    # silently — caught only when the 36-min Docker build tried to
+    # apply it. This job catches the same class of failure in ~30s
+    # before the publish workflow burns runner time on a doomed build.
+    #
+    # When this fails: see docs/TROUBLESHOOTING.md § "llama.cpp patch
+    # drift" for the bump runbook.
+    name: llama.cpp patches apply to pinned SHA
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: extract LLAMA_CPP_REV + check Dockerfiles agree
+        id: sha
+        # All four Dockerfiles (Dockerfile, Dockerfile.v31, Dockerfile.rocm,
+        # Dockerfile.vulkan) must agree on the pinned SHA. Disagreement
+        # would mean a bump landed in one place but not the others,
+        # which would publish inconsistent llama-server binaries across
+        # backends.
+        run: |
+          SHA=$(grep -oP '(?<=ARG LLAMA_CPP_REV=)[a-f0-9]+' inference/Dockerfile.v31 | head -1)
+          if [ -z "$SHA" ]; then
+            echo "::error::could not extract LLAMA_CPP_REV from inference/Dockerfile.v31"
+            exit 1
+          fi
+          echo "Pinned SHA: $SHA"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          for f in inference/Dockerfile inference/Dockerfile.rocm inference/Dockerfile.vulkan; do
+            if ! grep -q "LLAMA_CPP_REV=$SHA" "$f"; then
+              actual=$(grep -oP '(?<=ARG LLAMA_CPP_REV=)[a-f0-9]+' "$f" | head -1)
+              echo "::error file=$f::LLAMA_CPP_REV mismatch — found '$actual', expected '$SHA' (matches Dockerfile.v31). Bump all 4 Dockerfiles together."
+              exit 1
+            fi
+          done
+          echo "All 4 Dockerfiles agree on LLAMA_CPP_REV=$SHA"
+
+      - name: fetch pinned llama.cpp
+        # Mirror the production fetch pattern: init + shallow-fetch a
+        # specific SHA, not a full clone. GitHub supports
+        # uploadpack.allowReachableSHA1InWant so this is cheap (~30s).
+        run: |
+          git init -q llama.cpp
+          cd llama.cpp
+          git remote add origin https://github.com/ggml-org/llama.cpp
+          git -c http.postBuffer=524288000 \
+              fetch --depth 1 origin ${{ steps.sha.outputs.sha }}
+          git checkout -q FETCH_HEAD
+
+      - name: apply patches dry-run
+        # Two things the Dockerfiles actually do on the cloned llama.cpp
+        # tree before cmake; we mirror them both here:
+        #   1. `git apply` of expose-hidden-states.patch (PC-202).
+        #      Hard-fails the Docker build if it doesn't apply.
+        #   2. `sed -i '/auto params_dft = params_base;/a ...'` for the
+        #      spec-decode embeddings fix. The sed has `|| true`, so a
+        #      missing target line would silently no-op... we verify the
+        #      target line exists so that doesn't go unnoticed.
+        #
+        # NOTE: inference/patches/fix-embeddings-spec-decode.patch is
+        # NOT checked here. It's malformed (blank context lines lack
+        # leading space) and unused — the sed is what actually applies.
+        # That patch file should be either fixed or removed in a
+        # future cleanup; tracked informally for now.
+        run: |
+          cd llama.cpp
+          # 1. PC-202 hidden-states patch
+          patch_path=../inference/patches/expose-hidden-states.patch
+          if git apply --check "$patch_path" 2>&1; then
+            echo "  OK: expose-hidden-states.patch applies to ${{ steps.sha.outputs.sha }}"
+          else
+            echo "::error file=inference/patches/expose-hidden-states.patch::patch does not apply to LLAMA_CPP_REV=${{ steps.sha.outputs.sha }}. See docs/TROUBLESHOOTING.md § 'llama.cpp patch drift' for the bump runbook."
+            exit 1
+          fi
+          # 2. spec-decode embeddings fix (sed target must exist)
+          if grep -q 'auto params_dft = params_base;' tools/server/server-context.cpp; then
+            echo "  OK: spec-decode sed target present in server-context.cpp"
+          else
+            echo "::error::Dockerfile sed target 'auto params_dft = params_base;' not found in tools/server/server-context.cpp at LLAMA_CPP_REV=${{ steps.sha.outputs.sha }}. The embeddings spec-decode fix would silently no-op. See docs/TROUBLESHOOTING.md § 'llama.cpp patch drift'."
+            exit 1
+          fi
+          echo "All patch checks passed."

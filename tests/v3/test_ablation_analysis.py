@@ -10,7 +10,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 from benchmark.v3.ablation_analysis import (
     TaskOutcome,
     ConditionResult,
-    BootstrapResult,
     bootstrap_delta,
     multi_seed_pass_rate,
     extract_outcomes,

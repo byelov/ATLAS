@@ -16,8 +16,7 @@ Early Stop Conditions (ALL must be true):
 """
 
 import json
-import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -208,4 +207,5 @@ class ReASC:
             with open(self._events_file, "a") as f:
                 f.write(json.dumps(event.to_dict()) + "\n")
         except OSError:
+            # best-effort: swallow on failure (caller continues)
             pass

@@ -1,4 +1,4 @@
-"""HTTP client for Fox, geometric-lens, and sandbox. Pure urllib, no dependencies."""
+"""HTTP client for llama-server, geometric-lens, and sandbox. Pure urllib, no dependencies."""
 
 import json
 import os
@@ -9,7 +9,7 @@ from typing import Optional, List, Tuple
 INFERENCE_URL = os.environ.get("ATLAS_INFERENCE_URL", "http://localhost:8080")
 RAG_API_URL = os.environ.get("ATLAS_RAG_URL", "http://localhost:8099")
 SANDBOX_URL = os.environ.get("ATLAS_SANDBOX_URL", "http://localhost:8020")
-MODEL_NAME = os.environ.get("ATLAS_MODEL_NAME", "Qwen3.5-9B-Q6_K")
+MODEL_NAME = os.environ.get("ATLAS_MODEL_NAME", "local-model")
 
 
 def _post(url: str, body: dict, timeout: int = 120) -> dict:
@@ -49,7 +49,8 @@ def measure_speed() -> str:
     return "—"
 
 
-def check_fox() -> Tuple[bool, str]:
+def check_llama() -> Tuple[bool, str]:
+    """Check llama-server health."""
     try:
         _get(f"{INFERENCE_URL}/health")
         try:
@@ -83,7 +84,7 @@ def check_sandbox() -> Tuple[bool, str]:
 def generate(prompt: str, max_tokens: int = 8192,
              temperature: float = 0.6, stop: Optional[List[str]] = None,
              timeout: int = 900) -> dict:
-    """Generate via Fox /v1/completions (raw prompt, includes thinking)."""
+    """Generate via llama-server /v1/completions (raw prompt, includes thinking)."""
     body = {
         "model": MODEL_NAME,
         "prompt": prompt,
@@ -100,7 +101,7 @@ def generate(prompt: str, max_tokens: int = 8192,
 def generate_stream(prompt: str, max_tokens: int = 8192,
                     temperature: float = 0.6, stop: Optional[List[str]] = None,
                     timeout: int = 900):
-    """Stream generation via Fox /v1/completions with stream=true.
+    """Stream generation via llama-server /v1/completions with stream=true.
 
     Yields (token_text, is_done) tuples.
     """
@@ -155,7 +156,7 @@ def generate_stream(prompt: str, max_tokens: int = 8192,
 # --- Embeddings ---
 
 def get_embedding(text: str) -> Optional[List[float]]:
-    """Get embedding from Fox /embedding endpoint."""
+    """Get embedding from llama-server /embedding endpoint."""
     try:
         d = _post(f"{INFERENCE_URL}/embedding", {"content": text}, timeout=30)
         return d[0]["embedding"]

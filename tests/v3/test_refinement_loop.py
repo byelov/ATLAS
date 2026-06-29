@@ -1,14 +1,11 @@
 """Tests for V3 Refinement Loop (Feature 3E)."""
 
 import json
-import time
-from pathlib import Path
 from typing import List, Optional, Tuple
 
 import pytest
 
 from benchmark.v3.refinement_loop import (
-    CodeGenCallable,
     IterationResult,
     RefinementLoop,
     RefinementLoopConfig,
@@ -388,7 +385,9 @@ class TestEdgeCases:
         mock_llm = MockLLM()
         mock_sandbox = MockSandboxAlwaysPass()
         mock_embed = MockEmbed(dim=5)
-        result = loop_enabled.run(
+        # Run for the embed-call side effect; the result itself isn't asserted
+        # here (the assertion is on the mock's call log below).
+        _ = loop_enabled.run(
             problem="test", failing_candidates=sample_candidates,
             original_constraints=["c1"],
             llm_call=mock_llm, sandbox_run=mock_sandbox,

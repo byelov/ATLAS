@@ -1,7 +1,6 @@
 """Tests for V3 Derivation Chains (Feature 3D)."""
 
 import json
-from pathlib import Path
 from typing import Optional, Tuple
 
 import pytest

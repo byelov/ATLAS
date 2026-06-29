@@ -340,6 +340,7 @@ class FailureAnalyzer:
                     emb = embed_call(c.code)
                     analysis.failure_embeddings.append(emb)
                 except Exception:
+                    # best-effort: swallow on failure (caller continues)
                     pass
 
         elapsed = (time.time() - start_time) * 1000
@@ -396,4 +397,5 @@ class FailureAnalyzer:
             with open(self._events_file, "a") as f:
                 f.write(json.dumps(event.to_dict()) + "\n")
         except OSError:
+            # best-effort: swallow on failure (caller continues)
             pass

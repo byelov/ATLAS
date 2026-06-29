@@ -1,16 +1,15 @@
 """
 GPQA Diamond dataset loader.
 
-Downloads GPQA Diamond (198 graduate-level multiple choice questions) via
-the HuggingFace rows API. Questions cover biology, physics, and chemistry
-and are designed to be "Google-proof".
+Downloads GPQA Diamond (198 graduate-level multiple choice questions) from
+OpenAI's public blob storage as CSV. Questions cover biology, physics, and
+chemistry and are designed to be "Google-proof".
 
-Source: https://huggingface.co/datasets/Idavidrein/gpqa
+Source: https://openaipublic.blob.core.windows.net/simple-evals/gpqa_diamond.csv
 """
 
 import csv
 import io
-import json
 import re
 import urllib.request
 from pathlib import Path
@@ -18,6 +17,7 @@ from typing import List, Optional
 
 from .base import BaseDataset
 from ..models import BenchmarkTask
+from ..llm_client import strip_reasoning_leak
 
 
 # Regex cascade for answer extraction (from Artificial Analysis methodology)
@@ -49,8 +49,8 @@ def extract_mcq_answer(response: str) -> Optional[str]:
     Returns:
         Single uppercase letter (A/B/C/D) or None if extraction fails.
     """
-    # Strip thinking blocks
-    response = re.sub(r'<think>.*?</think>', '', response, flags=re.DOTALL).strip()
+    # Strip thinking blocks (generic, single source of truth)
+    response = strip_reasoning_leak(response).strip()
 
     for pattern in _ANSWER_PATTERNS:
         matches = re.findall(pattern, response)

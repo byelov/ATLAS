@@ -12,7 +12,7 @@ from models.tree_node import TreeNode, NodeType
 logger = logging.getLogger(__name__)
 
 # Default llama-server URL (overridable)
-LLAMA_URL = "http://llama-service:8000"
+LLAMA_URL = "http://llama-server:8080"
 
 
 async def summarize_tree(
@@ -187,8 +187,8 @@ async def _llm_summarize(
 
 
 def _clean_reasoning_preamble(text: str) -> str:
-    """Strip LLM reasoning preamble from Qwen3 reasoning_content responses."""
-    # Remove common reasoning starters that Qwen3 produces
+    """Strip a reasoning preamble from reasoning-capable model responses."""
+    # Remove common reasoning starters emitted by several chat templates.
     # Pattern: "Okay, let's see. The user wants me to..." up to the actual content
     # The actual summary usually starts after a sentence about "The function/class..."
     lines = text.split("\n")

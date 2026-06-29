@@ -54,8 +54,8 @@ git checkout -b feature/your-feature-name
 cp .env.example .env
 # Edit .env if you need to change model path or ports
 
-# Run tests before making changes
-python tests/validate_tests.py
+# Run the complete developer quality gate before making changes
+python scripts/production-readiness.py
 ```
 
 #### Making Changes
@@ -84,7 +84,7 @@ Examples:
 
 #### Submitting
 
-1. Ensure all tests pass: `python tests/validate_tests.py`
+1. Ensure all required checks pass: `python scripts/production-readiness.py`
 2. Update CHANGELOG.md if applicable
 3. Push to your fork
 4. Open a pull request with:
@@ -97,6 +97,34 @@ Examples:
 - Address review feedback promptly
 - Explain your decisions when disagreeing
 - Request re-review after making changes
+
+### Contributing Trained Artifacts (Lens / ASA)
+
+Code isn't the only thing you can contribute. ATLAS ships per-model
+**Geometric Lens** cost fields (`cost_field.pt`) and **ASA control
+vectors** (`*.gguf`) — these are coupled to the base model they were
+trained against, so every new model needs its own pair before ATLAS
+runs end-to-end against it. If you've trained one, please contribute
+it back!
+
+Artifact contributions follow a different workflow than code changes:
+
+- You train locally with `atlas lens build` / `atlas asa build`
+- You run `atlas lens publish` / `atlas asa publish`, which uploads the
+  binary to a HuggingFace repo you own AND opens a registry PR on this
+  repo containing the HF link + SHA-256 + dim
+- The maintainer pulls the artifact onto a verification VM, runs it
+  against a private trust-gate set, and merges (or asks for changes)
+  on the PR
+
+You do NOT need a GitHub PAT or write access to this repo. The minimum
+requirement is a HuggingFace account + write token. Full walkthrough,
+including credential setup, what happens after submission, and
+troubleshooting:
+
+→ **[docs/PUBLISHING.md](docs/PUBLISHING.md)**
+
+CLI flag reference for the publish commands lives in [docs/CLI.md](docs/CLI.md).
 
 ## Code Style
 
@@ -163,8 +191,11 @@ fi
 ### Running Tests
 
 ```bash
-# Run all tests
-python tests/validate_tests.py
+# Run the developer quality gate
+python scripts/production-readiness.py
+
+# Run only the test-integrity validator
+python scripts/production-readiness.py --only test-integrity
 
 # Run specific test file
 pytest tests/v3/test_plan_search.py -v
@@ -217,11 +248,11 @@ Releases are handled by maintainers:
 
 ## License
 
-This project is licensed under the **ATLAS Source Available License v1.0** (see [LICENSE](LICENSE)).
+This project is licensed under the **GNU Affero General Public License v3.0 (AGPL-3.0)** (see [LICENSE](LICENSE)).
 
 By submitting a contribution (pull request, patch, or any other form), you agree to the following terms:
 
-- Your contributions are accepted under the same license as the project: the ATLAS Source Available License v1.0.
+- Your contributions are accepted under the same license as the project: AGPL-3.0.
 - You retain copyright of your contributions.
 - You grant the project maintainer (Isaac Tigges) a perpetual, irrevocable, worldwide, royalty-free license to use, modify, and distribute your contributions under the project license.
 - You represent that you have the legal right to grant this license and that your contributions do not infringe on any third-party rights.

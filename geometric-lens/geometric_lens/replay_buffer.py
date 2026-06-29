@@ -13,7 +13,7 @@ each domain contributes proportionally during replay.
 import json
 import os
 import random
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
 @dataclass
@@ -28,7 +28,7 @@ class ReplayBuffer:
     """Domain-stratified experience replay for C(x) continual learning.
 
     Each entry stores:
-        embedding: list[float]  — 5120-dim self-embedding
+        embedding: list[float]  — model self-embedding (hidden-dim length)
         label: str              — "PASS" or "FAIL"
         domain: str             — "LCB", "SciCode", "Custom", "TheoryFormation"
         epoch: int              — training epoch when learned
@@ -149,7 +149,7 @@ class ReplayBuffer:
         """Save buffer to JSON file.
 
         Embeddings are stored as lists of floats. File size for 5000 entries
-        with 5120-dim embeddings: ~100MB raw JSON, but typically much less
+        with 4096-dim embeddings: ~80MB raw JSON, but typically much less
         since most buffers won't be full.
         """
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)

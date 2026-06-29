@@ -310,7 +310,7 @@ class MBPPDataset(BaseDataset):
         tags = ["python"]
 
         text_lower = text.lower()
-        code_lower = code.lower()
+        code.lower()
 
         if "list" in text_lower or "array" in text_lower:
             tags.append("list")

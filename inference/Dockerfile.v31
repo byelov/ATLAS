@@ -1,24 +1,138 @@
-FROM docker.io/nvidia/cuda:12.8.0-devel-rockylinux9 AS builder
-RUN dnf install -y git cmake gcc-c++ && dnf clean all
+# syntax=docker/dockerfile:1.4
+# (Enables RUN --mount=type=cache for the ccache persist below. Native
+# in BuildKit since 1.0 but explicit is clearer.)
+
+# arm64 (#115): default base image is rockylinux9, which is x86_64-only.
+# Override on aarch64 hosts (DGX Spark = sbsa, Jetson = l4t) by passing
+# --build-arg BUILDER_IMAGE=... + --build-arg RUNTIME_IMAGE=... pointing
+# at the NVIDIA arm64 variant. Recipes:
+#   DGX Spark / Grace-Blackwell (sbsa):
+#     --build-arg BUILDER_IMAGE=nvidia/cuda:12.9.0-devel-ubuntu22.04
+#     --build-arg RUNTIME_IMAGE=nvidia/cuda:12.9.0-runtime-ubuntu22.04
+#     (ubuntu variants ship both amd64 and arm64-sbsa via buildx)
+#   Jetson Orin (l4t):
+#     --build-arg BUILDER_IMAGE=nvcr.io/nvidia/l4t-jetpack:r36.3.0
+#     --build-arg RUNTIME_IMAGE=nvcr.io/nvidia/l4t-jetpack:r36.3.0
+# Then build with `--platform linux/arm64` via buildx. The dnf -> apt
+# differences are handled by the package install step below (the recipe
+# uses apt if dnf isn't present).
+ARG BUILDER_IMAGE=docker.io/nvidia/cuda:12.9.0-devel-rockylinux9
+ARG RUNTIME_IMAGE=docker.io/nvidia/cuda:12.9.0-runtime-rockylinux9
+FROM ${BUILDER_IMAGE} AS builder
+# CUDA compute capability of the target GPU. Override at build time:
+#   podman build --build-arg CUDA_ARCH=89 -f Dockerfile.v31
+# Common values:
+#   60,61 = Pascal (GTX 10xx, Tesla P4/P40)
+#   70    = Volta (V100)
+#   75    = Turing (RTX 20xx, T4)
+#   80,86 = Ampere (A100, RTX 30xx)
+#   87    = Orin/Jetson AGX
+#   89    = Ada Lovelace (RTX 40xx, L4)
+#   90    = Hopper (H100)
+#   100,120,121 = Blackwell (B100, RTX 50xx, DGX Spark GB10)
+# Multiple archs can be passed semicolon-separated, e.g. "86;89;90".
+ARG CUDA_ARCH=120;121
+# Install build deps. Default rockylinux9 uses dnf; ubuntu/l4t variants
+# use apt. Try dnf first, fall back to apt-get so the same Dockerfile
+# works across base-image overrides (#115). ccache is added so the
+# cmake build below can persist compiler outputs across LLAMA_CPP_REV
+# bumps (#117) — content-addressed object cache means 80%+ hit rate
+# for typical upstream churn. Note: ccache lives in EPEL on rockylinux,
+# not the default repos, so we enable EPEL before the install.
+RUN if command -v dnf >/dev/null 2>&1; then \
+        dnf install -y epel-release && \
+        dnf install -y git cmake gcc-c++ ccache && \
+        dnf clean all; \
+    else \
+        apt-get update && apt-get install -y --no-install-recommends \
+            git cmake build-essential ccache ca-certificates && \
+        rm -rf /var/lib/apt/lists/*; \
+    fi
 # Use /llama.cpp/tmp for build temp to avoid /tmp space exhaustion
 ENV TMPDIR=/llama.cpp/tmp
-RUN git clone https://github.com/ggml-org/llama.cpp /llama.cpp && \
+# Patches applied to llama.cpp before build. Keep this stage cache-friendly:
+# patches changes -> rebuild; everything else stays cached.
+COPY patches/ /patches/
+# Pin llama.cpp to a known-good SHA so the PC-202 hidden-states patch
+# applies cleanly. Without this pin, every build pulls master HEAD and
+# upstream context drift periodically breaks the patch (saw this break
+# the publish workflow on 2026-05-20 when upstream removed a blank line
+# in server-context.cpp, shifting the patch's line numbers by 1).
+# Bump this when:
+#   1. There's a llama.cpp release with a feature/fix we want
+#   2. The PC-202 patch has been regenerated against the new upstream
+# Override at build time: --build-arg LLAMA_CPP_REV=<sha>
+ARG LLAMA_CPP_REV=2e97c5f96f9fe2bb26f794a348e05d7a1c74baa1
+# #117: Split fetch -> patch -> build into three RUN layers so a
+# LLAMA_CPP_REV bump or a patches/ change invalidates only the affected
+# layer + everything below, not the whole giant step. The build is the
+# expensive one; ccache (mounted below) further mitigates SHA bumps by
+# preserving compiled object files keyed on source content hash.
+
+# 1. Fetch llama.cpp at the pinned SHA. Invalidated by LLAMA_CPP_REV.
+#    Init + shallow-fetch a single SHA avoids the ~1GB full-history
+#    clone while still letting us pin to a specific commit (GitHub
+#    supports uploadpack.allowReachableSHA1InWant). http.postBuffer
+#    bump helps large packs; lowSpeedLimit/Time abort fast on dead
+#    connections. See docs/TROUBLESHOOTING.md "llama.cpp clone times out".
+RUN git init /llama.cpp && \
     cd /llama.cpp && \
-    mkdir -p /llama.cpp/tmp && \
-    # ATLAS patch: prevent --embeddings from poisoning the draft model context.
-    # Kept for compatibility — harmless when no draft model is used (Qwen3.5).
-    # If the patch target line doesn't exist in newer versions, the sed is a no-op.
+    git remote add origin https://github.com/ggml-org/llama.cpp && \
+    git -c http.postBuffer=524288000 \
+        -c http.lowSpeedLimit=1000 \
+        -c http.lowSpeedTime=60 \
+        fetch --depth 1 origin ${LLAMA_CPP_REV} && \
+    git checkout FETCH_HEAD && \
+    mkdir -p /llama.cpp/tmp
+
+# 2. Apply patches. Invalidated by /patches contents OR LLAMA_CPP_REV
+#    (latter via the previous layer). Cheap step (~1s) so re-running
+#    on patch tweaks is fine.
+#    - sed: spec-decode embeddings fix. Kept for compatibility, harmless
+#      when no draft model is used. Falls through silently if
+#      the target line doesn't exist in newer upstream.
+#    - git apply: PC-202 hidden-states patch. Adds optional `layers:
+#      [int]` request param; response gains `hidden_states` (base64
+#      float32 per layer) for PC-203 SAE + PC-207 lens-as-PRM. No-op
+#      when `layers` is omitted. See ISSUES.md PC-202.
+RUN cd /llama.cpp && \
     sed -i '/auto params_dft = params_base;/a\        params_dft.embedding = false;  // ATLAS: draft never needs embeddings' \
         tools/server/server-context.cpp 2>/dev/null || true && \
-    cmake -B build -DGGML_CUDA=ON -DBUILD_SHARED_LIBS=OFF -DCMAKE_CUDA_ARCHITECTURES=120 && \
-    cmake --build build --config Release -j5
+    git apply --check /patches/expose-hidden-states.patch && \
+    git apply         /patches/expose-hidden-states.patch
 
-FROM docker.io/nvidia/cuda:12.8.0-runtime-rockylinux9
+# 3. Build. The slow one (~5-30min depending on host + GPU arch count).
+#    --mount=type=cache for /root/.ccache persists compiled object
+#    files across builds — ccache is content-addressed so even after a
+#    SHA bump invalidates this layer, the unchanged source files still
+#    hit the on-disk cache. id=llama-ccache shares the cache across
+#    all Dockerfile.* in this dir; sharing=locked prevents concurrent
+#    writes if multiple builds run in parallel. #117.
+RUN --mount=type=cache,id=llama-ccache,target=/root/.ccache,sharing=locked \
+    cd /llama.cpp && \
+    cmake -B build \
+        -DGGML_CUDA=ON \
+        -DBUILD_SHARED_LIBS=OFF \
+        -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCH}" \
+        -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+        -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+        -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache && \
+    cmake --build build --config Release -j5 && \
+    ccache --show-stats || true
+
+FROM ${RUNTIME_IMAGE}
+# Re-declare ARG after FROM so the runtime stage can reference it if
+# needed; Docker scopes ARGs per-stage unless re-declared.
+ARG RUNTIME_IMAGE
 COPY --from=builder /llama.cpp/build/bin/llama-server /usr/local/bin/
 COPY --from=builder /llama.cpp/build/bin/llama-cli /usr/local/bin/
+# Ship cvector-generator alongside llama-server so the bootstrap can run
+# the ASA steering-vector build (BiasBusters #4) as a one-shot container
+# without needing a separate llama.cpp install on the host.
+COPY --from=builder /llama.cpp/build/bin/llama-cvector-generator /usr/local/bin/
 RUN mkdir -p /models /templates
 COPY templates/ /templates/
-COPY entrypoint-v3.1-9b.sh /entrypoint.sh
+COPY entrypoint-v3.1.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 EXPOSE 8000
 ENTRYPOINT ["/entrypoint.sh"]

@@ -9,8 +9,8 @@
 #   sandbox        :8020 (Python / FastAPI)
 #   redis          :6379 (via brew services)
 #
-# Optional (set ATLAS_RUN_PROXY=1 to also start atlas-proxy):
-#   atlas-proxy    :8090 (Go — needed for Aider integration)
+# Optional (set ATLAS_RUN_PROXY=1 to also start the proxy):
+#   proxy          :8090 (Go — grammar-constrained agent loop)
 #
 # After all services are healthy, launches:
 #   atlas  (interactive REPL)
@@ -143,13 +143,13 @@ echo "  PID $SANDBOX_PID → $LOG_DIR/sandbox.log"
 
 wait_healthy "sandbox" "http://localhost:8020/health" 30 2
 
-# ── 5. atlas-proxy ───────────────────────────────────────────────────────────
-step "atlas-proxy (port 8090)"
+# ── 5. proxy ──────────────────────────────────────────────────────────────────
+step "proxy (port 8090)"
 
 PROXY_BIN="${HOME}/.local/bin/atlas-proxy"
 if [[ ! -x "$PROXY_BIN" ]]; then
-    warn "atlas-proxy not found — building now"
-    (cd atlas-proxy && go build -o "$PROXY_BIN" .)
+    warn "proxy not found — building now"
+    (cd proxy && go build -o "$PROXY_BIN" .)
 fi
 
 if lsof -ti :8090 &>/dev/null; then

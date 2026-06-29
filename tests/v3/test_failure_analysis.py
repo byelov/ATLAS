@@ -1,7 +1,6 @@
 """Tests for V3 Failure Analysis (Feature 3A)."""
 
 import json
-from pathlib import Path
 from typing import List, Optional, Tuple
 
 import pytest
@@ -44,7 +43,7 @@ class MockLLM:
 class MockEmbed:
     """Mock embedding callable that returns fixed-size vectors."""
 
-    def __init__(self, dim: int = 5120):
+    def __init__(self, dim: int = 4096):
         self.dim = dim
         self.calls: list = []
 

@@ -7,12 +7,10 @@ pass@k = 1 - C(n-c, k) / C(n, k)
 where n = total samples, c = correct samples, k = number of attempts
 """
 
-import json
 import math
 import random
 from dataclasses import dataclass, field
-from typing import List, Dict, Any, Optional
-from pathlib import Path
+from typing import List, Dict, Any
 
 from ..models import TaskResult, BenchmarkRun
 from ..config import config
@@ -191,9 +189,10 @@ def calculate_pass_at_k(
     per_task_c = {}  # task_id -> number correct
 
     for result in results:
-        n = result.num_attempts
-        c = result.num_passed
-        per_task_c[result.task_id] = c
+        # n / c assignments removed — n was shadowed by the comprehension
+        # below and c is only used to populate the dict, so the locals
+        # added noise without value (py/multiple-definition).
+        per_task_c[result.task_id] = result.num_passed
 
     # Calculate pass@k for each k
     pass_at_k_scores = {}
@@ -284,7 +283,7 @@ def compare_with_baseline(
         Markdown comparison table
     """
     if baseline_pass1 is None:
-        # Use Qwen3-14B baselines from config
+        # Use baselines from config
         baselines = config.qwen3_14b_baselines
         key = f"{result.dataset}_pass1"
         baseline_pass1 = baselines.get(key, 0.0)
@@ -301,8 +300,8 @@ def compare_with_baseline(
     lines = [
         "## Comparison with Baseline",
         "",
-        "| Metric | ATLAS V1 | Qwen3-14B Baseline | Difference |",
-        "|--------|----------|-------------------|------------|",
+        "| Metric | ATLAS | Baseline | Difference |",
+        "|--------|-------|----------|------------|",
         f"| pass@1 | {result.pass_at_1:.1%} | {baseline_pass1:.1%} | {diff_str} |",
     ]
 

@@ -16,8 +16,6 @@ Playbook entries are:
 """
 
 import json
-import math
-import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -447,6 +445,7 @@ class ACEPipeline:
             if isinstance(data, list):
                 self._playbook = [PlaybookEntry.from_dict(e) for e in data]
         except (OSError, json.JSONDecodeError):
+            # best-effort: swallow on failure (caller continues)
             pass
 
     def _save(self, path: str) -> None:
@@ -455,6 +454,7 @@ class ACEPipeline:
             with open(path, 'w') as f:
                 json.dump(self.to_dict(), f, indent=2)
         except OSError:
+            # best-effort: swallow on failure (caller continues)
             pass
 
     def _log_event(self, event: ACEEvent) -> None:
@@ -464,4 +464,5 @@ class ACEPipeline:
             with open(self._events_file, "a") as f:
                 f.write(json.dumps(event.to_dict()) + "\n")
         except OSError:
+            # best-effort: swallow on failure (caller continues)
             pass

@@ -1,7 +1,7 @@
 """V3 Metacognitive Model (Feature 3F) — Failure Pattern Modeling.
 
-Builds an explicit model of Qwen3-14B-Q4_K_M's systematic failure patterns
-per problem category. Stores patterns as a JSON lookup table and injects
+Builds an explicit model of the LLM's systematic failure patterns per
+problem category. Stores patterns as a JSON lookup table and injects
 compensating constraints before generation for known weaknesses.
 
 Config: [metacognitive] in atlas.conf
@@ -14,11 +14,12 @@ self-knowledge.
 """
 
 import json
-import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
+
+from benchmark.llm_client import strip_reasoning_leak
 
 
 # Type alias for LLM callable
@@ -122,6 +123,9 @@ class MetacognitiveEvent:
 def parse_patterns(response: str) -> List[FailurePattern]:
     """Parse failure patterns from LLM analysis response."""
     import re
+    # Safety net: remove any leaked <think> reasoning before structured parsing
+    # (model-agnostic, single source of truth in benchmark.llm_client).
+    response = strip_reasoning_leak(response)
     patterns: List[FailurePattern] = []
 
     # Look for PATTERN N: blocks
@@ -144,6 +148,7 @@ def parse_patterns(response: str) -> List[FailurePattern]:
                 if fp.frequency > 1.0:
                     fp.frequency /= 100.0  # Convert percentage
             except ValueError:
+                # best-effort: swallow on failure (caller continues)
                 pass
 
         comp_match = re.search(r'(?:COMPENSATION|CONSTRAINT)[:\s]*(.*?)$',
@@ -169,7 +174,7 @@ def parse_patterns(response: str) -> List[FailurePattern]:
 # ---------------------------------------------------------------------------
 
 class MetacognitiveProfile:
-    """Explicit model of Qwen3-14B's systematic failure patterns.
+    """Explicit model of the LLM's systematic failure patterns.
 
     When enabled, maintains a profile of category-specific weaknesses and
     provides compensating constraints during generation.
@@ -358,6 +363,7 @@ class MetacognitiveProfile:
                     FailurePattern.from_dict(e) for e in entries
                 ]
         except (OSError, json.JSONDecodeError):
+            # best-effort: swallow on failure (caller continues)
             pass
 
     def _save(self, path: str) -> None:
@@ -366,6 +372,7 @@ class MetacognitiveProfile:
             with open(path, 'w') as f:
                 json.dump(self.to_dict(), f, indent=2)
         except OSError:
+            # best-effort: swallow on failure (caller continues)
             pass
 
     def _log_event(self, event: MetacognitiveEvent) -> None:
@@ -375,4 +382,5 @@ class MetacognitiveProfile:
             with open(self._events_file, "a") as f:
                 f.write(json.dumps(event.to_dict()) + "\n")
         except OSError:
+            # best-effort: swallow on failure (caller continues)
             pass

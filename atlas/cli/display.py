@@ -6,7 +6,6 @@ Inspired by OpenCode/Crush terminal UI design.
 
 import sys
 import shutil
-import os
 
 # ANSI escape codes
 RESET = "\033[0m"
@@ -246,10 +245,9 @@ def warn(msg: str):
 
 def progress_bar(current: int, total: int, pass_count: int, label: str = ""):
     """Inline progress bar for benchmarks."""
-    bar_w = min(w() - 50, 25)
+    bar_w = max(1, min(w() - 50, 25))
     filled = int(bar_w * current / max(total, 1))
     bar = f"{BRIGHT_CYAN}{'█' * filled}{GRAY}{'░' * (bar_w - filled)}{RESET}"
-    pct = current / max(total, 1) * 100
     pass_rate = pass_count / max(current, 1) * 100
     line = f"\r  {bar} {BOLD}{current}{RESET}/{total}  {BRIGHT_GREEN}{pass_rate:.1f}%{RESET}  {DIM}{label}{RESET}"
     _write(line)

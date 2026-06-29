@@ -21,9 +21,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
+from benchmark.llm_client import strip_reasoning_leak
+
 from .failure_analysis import (
     FailingCandidate,
-    FailureAnalysis,
     FailureAnalyzer,
     FailureAnalysisConfig,
 )
@@ -226,6 +227,7 @@ class RefinementLoop:
                     emb = embed_call(c.code)
                     all_failed_embeddings.append(emb)
                 except Exception:
+                    # best-effort: swallow on failure (caller continues)
                     pass
 
         # Current failure set (mutable across iterations)
@@ -317,6 +319,7 @@ class RefinementLoop:
                         emb = embed_call(code)
                         all_failed_embeddings.append(emb)
                     except Exception:
+                        # best-effort: swallow on failure (caller continues)
                         pass
 
         if not result.solved and not result.reason:
@@ -365,7 +368,9 @@ class RefinementLoop:
     def _extract_code(self, response: str) -> str:
         """Extract code from LLM response."""
         import re
-        response = re.sub(r'<think>.*?</think>', '', response, flags=re.DOTALL).strip()
+        # Safety net: client returns clean content, but strip any leaked
+        # reasoning block model-agnostically before code extraction.
+        response = strip_reasoning_leak(response)
         py_blocks = re.findall(r'```python\s*\n(.*?)```', response, re.DOTALL)
         if py_blocks:
             return py_blocks[-1].strip()
@@ -382,4 +387,5 @@ class RefinementLoop:
             with open(self._events_file, "a") as f:
                 f.write(json.dumps(event.to_dict()) + "\n")
         except OSError:
+            # best-effort: swallow on failure (caller continues)
             pass

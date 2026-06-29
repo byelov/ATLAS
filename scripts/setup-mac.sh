@@ -138,10 +138,10 @@ for fpath in files:
         print(f'  Skipped {fname}: {e}')
 EOF
 
-# ── 8. Build atlas-proxy ──────────────────────────────────────────────────────
-step "Building atlas-proxy (Go)"
+# ── 8. Build proxy ────────────────────────────────────────────────────────────
+step "Building proxy (Go)"
 
-cd atlas-proxy
+cd proxy
 mkdir -p "$HOME/.local/bin"
 go build -o "$HOME/.local/bin/atlas-proxy" .
 cd ..

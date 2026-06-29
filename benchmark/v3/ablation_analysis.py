@@ -290,7 +290,7 @@ def ablation_table(conditions: Dict[str, List[ConditionResult]]) -> str:
 
         # Bootstrap CI across seeds on the mean
         if n_seeds >= 2:
-            rates = [r.pass_rate for r in results]
+            [r.pass_rate for r in results]
             ci_lo = mean_rate - 1.96 * std_rate / math.sqrt(n_seeds)
             ci_hi = mean_rate + 1.96 * std_rate / math.sqrt(n_seeds)
             ci_str = f"[{ci_lo:.1%}, {ci_hi:.1%}]"

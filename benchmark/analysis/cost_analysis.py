@@ -7,8 +7,7 @@ and novel efficiency metrics like Tokens/Watt-Hour.
 
 import statistics
 from dataclasses import dataclass, field
-from typing import Dict, Any, List, Optional
-from pathlib import Path
+from typing import Dict, Any, List
 
 from ..models import BenchmarkRun, TaskResult
 from ..config import config
@@ -277,7 +276,7 @@ class CostAnalyzer:
             f"- **Tokens per Watt-Hour:** {metrics.tokens_per_watt_hour:,.0f}",
             f"- **Tasks per Watt-Hour:** {metrics.tasks_per_watt_hour:.2f}",
             "",
-            "*These are novel metrics establishing ATLAS V1 baselines.*",
+            "*These are novel metrics establishing ATLAS baselines.*",
             "",
             "### Cloud API Cost Comparison",
             "",

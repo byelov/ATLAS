@@ -58,7 +58,6 @@ _ERROR_TYPE_MAP = {
     'ImportError': FailureType.IMPORT_ERROR,
     'ModuleNotFoundError': FailureType.IMPORT_ERROR,
     'AssertionError': FailureType.ASSERTION_ERROR,
-    'AssertionError': FailureType.ASSERTION_ERROR,
     'MemoryError': FailureType.MEMORY_ERROR,
     'TimeoutError': FailureType.TIMEOUT,
     'ZeroDivisionError': FailureType.RUNTIME_ERROR,
@@ -262,8 +261,13 @@ def _detect_error_type(stderr: str) -> tuple:
             msg = syntax_match.group(1)
         return FailureType.SYNTAX_ERROR, msg, 'SyntaxError'
 
-    # Fallback: look for any exception-like pattern
-    exc_match = re.search(r'(\w+(?:Error|Exception)): (.+)', stderr)
+    # Fallback: look for any exception-like pattern.
+    # Bounded quantifier on the class name (max 64 word chars) caps
+    # backtracking — a pathological stderr like "A"*1e6 + "Error: ..."
+    # would otherwise spend O(n^2) walking back through every prefix.
+    # 64 covers every Python builtin exception + most reasonable
+    # framework names (DjangoValidationError = 22 chars).
+    exc_match = re.search(r'(\w{1,64}(?:Error|Exception)): (.+)', stderr)
     if exc_match:
         error_class = exc_match.group(1)
         error_msg = exc_match.group(2)

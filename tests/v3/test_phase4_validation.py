@@ -17,12 +17,12 @@ import tempfile
 import time
 
 import pytest
-import torch
+
+torch = pytest.importorskip("torch")
 
 # geometric-lens is a separate service
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "geometric-lens"))
 
-from geometric_lens.cost_field import CostField
 from geometric_lens.ewc import ElasticWeightConsolidation
 from geometric_lens.replay_buffer import ReplayBuffer
 from geometric_lens.training import retrain_cost_field_bce, compute_energy_auc
@@ -231,7 +231,7 @@ class TestPhase4Performance:
         elapsed = time.time() - start
         print(f"\n3-domain retrain cycle: {elapsed:.1f}s")
 
-        # Small dim should be very fast; 5120-dim target is < 5 min
+        # Small dim should be very fast; 4096-dim target is < 5 min
         assert elapsed < 60, f"Retrain cycle took {elapsed:.1f}s"
 
 

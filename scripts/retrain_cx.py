@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 import os
 ATLAS_DIR = os.environ.get("ATLAS_DIR", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-"""Retrain C(x) cost field using Fox 9B embeddings.
+"""Retrain C(x) cost field using the selected llama-server model.
 
 Collects code + pass/fail labels from ablation results,
-embeds each through Fox at localhost:8080, then trains
+embeds each through llama-server at localhost:8080, then trains
 the cost field to discriminate PASS vs FAIL.
 """
 
@@ -17,17 +17,37 @@ import random
 from urllib.request import Request, urlopen
 
 # Add geometric-lens to path for imports
-sys.path.insert(0, '" + ATLAS_DIR + "/geometric-lens')
+sys.path.insert(0, os.path.join(ATLAS_DIR, "geometric-lens"))
 
-FOX_URL = "http://localhost:8080/embedding"
-MODELS_DIR = "" + ATLAS_DIR + "/geometric-lens/geometric_lens/models"
-DATA_DIR = "" + ATLAS_DIR + "/v3_ablation_results/condition_a"
+LLAMA_BASE_URL = os.environ.get(
+    "ATLAS_INFERENCE_URL", os.environ.get("LLAMA_URL", "http://localhost:8080")
+).rstrip("/")
+LLAMA_EMBED_URL = f"{LLAMA_BASE_URL}/embedding"
+MODELS_DIR = os.path.join(ATLAS_DIR, "geometric-lens", "geometric_lens", "models")
+DATA_DIR = os.path.join(ATLAS_DIR, "docs", "reports", "ablation", "condition_a")
 
 
-def get_fox_embedding(text: str, retries=2) -> list:
-    """Get 4096-dim embedding from Fox 9B."""
+def get_loaded_model_name() -> str:
+    """Return llama-server's loaded model id for artifact provenance."""
+    try:
+        with urlopen(f"{LLAMA_BASE_URL}/v1/models", timeout=10) as resp:
+            data = json.loads(resp.read())
+        models = data.get("data", [])
+        if models and models[0].get("id"):
+            return str(models[0]["id"])
+    except Exception:
+        pass
+    return os.environ.get("ATLAS_MODEL_NAME", "unknown-local-model")
+
+
+def get_llama_embedding(text: str, retries: int = 2) -> list:
+    """Get a model-native embedding from llama-server.
+
+    Returns the pooled embedding list, or raises the underlying urlopen
+    exception after exhausting retries.
+    """
     payload = json.dumps({"content": text}).encode()
-    req = Request(FOX_URL, data=payload, headers={"Content-Type": "application/json"})
+    req = Request(LLAMA_EMBED_URL, data=payload, headers={"Content-Type": "application/json"})
     for attempt in range(retries + 1):
         try:
             with urlopen(req, timeout=30) as resp:
@@ -50,6 +70,10 @@ def get_fox_embedding(text: str, retries=2) -> list:
                 time.sleep(1)
             else:
                 raise
+    # Unreachable: range(retries+1) always iterates at least once with
+    # the default retries=2; making the falloff explicit so the
+    # function's return contract matches its signature (py/mixed-returns).
+    raise RuntimeError("unreachable: retries must be >= 0")
 
 
 def collect_samples():
@@ -73,10 +97,13 @@ def collect_samples():
     # Source 1: V3 ablation condition_a (has code directly)
     for f in sorted(glob.glob(os.path.join(DATA_DIR, "*.json"))):
         try:
-            d = json.load(open(f))
+            with open(f) as fh:
+                d = json.load(fh)
             add_sample(d.get("code", ""), d.get("passed", False),
                        d.get("task_id", os.path.basename(f)))
         except Exception:
+            # Best-effort over hundreds of result files: skip on any
+            # individual parse failure rather than aborting the whole run.
             pass
 
     # Source 2: V2 epoch results (code in attempts[].generated_code)
@@ -85,19 +112,21 @@ def collect_samples():
     for d in v2_dirs:
         for f in sorted(glob.glob(os.path.join(d, "*.json"))):
             try:
-                data = json.load(open(f))
+                with open(f) as fh:
+                    data = json.load(fh)
                 for a in data.get("attempts", []):
                     code = a.get("generated_code", "")
                     add_sample(code, a.get("passed", False),
                                a.get("task_id", os.path.basename(f)))
             except Exception:
+                # Same best-effort guard as Source 1.
                 pass
 
     return samples
 
 
 def embed_samples(samples):
-    """Embed all code samples through Fox."""
+    """Embed all code samples through llama-server."""
     embeddings = []
     labels = []
     total = len(samples)
@@ -107,7 +136,7 @@ def embed_samples(samples):
             print(f"  Embedding {i+1}/{total}...", flush=True)
 
         try:
-            emb = get_fox_embedding(s["code"])
+            emb = get_llama_embedding(s["code"])
             embeddings.append(emb)
             labels.append(s["label"])
         except Exception as e:
@@ -207,7 +236,7 @@ def train_model(embeddings, labels):
             model.eval()
             with torch.no_grad():
                 val_pred = model(X_val).squeeze(-1)
-                val_loss = ((val_pred - Y_val) ** 2).mean().item()
+                ((val_pred - Y_val) ** 2).mean().item()
 
                 # Compute AUC
                 val_auc = compute_auc(val_pred.numpy(), labels_val)
@@ -273,7 +302,7 @@ def compute_auc(scores, labels):
 
 def main():
     print("=" * 60)
-    print("C(x) Cost Field Retraining — Fox 9B Embeddings")
+    print("C(x) Cost Field Retraining — selected-model embeddings")
     print("=" * 60)
 
     # Step 1: Collect labeled code
@@ -296,8 +325,8 @@ def main():
     n_fail = sum(1 for s in samples if s["label"] == "FAIL")
     print(f"  After balancing: {len(samples)} samples ({n_pass} PASS, {n_fail} FAIL)")
 
-    # Step 2: Embed through Fox
-    print("\n[2/4] Embedding through Fox 9B (this takes a few minutes)...")
+    # Step 2: Embed through llama-server
+    print("\n[2/4] Embedding through llama-server (this takes a few minutes)...")
     start = time.time()
     embeddings, labels = embed_samples(samples)
     elapsed = time.time() - start
@@ -305,14 +334,15 @@ def main():
     print(f"  Embedding dim: {len(embeddings[0])}")
 
     # Save embeddings for future use
-    emb_path = os.path.join(MODELS_DIR, "training_embeddings_fox9b.json")
+    model_name = get_loaded_model_name()
+    emb_path = os.path.join(MODELS_DIR, "training_embeddings_selected_model.json")
     print(f"\n[3/4] Saving embeddings to {emb_path}...")
     with open(emb_path, 'w') as f:
         json.dump({
             "embeddings": embeddings,
             "labels": labels,
             "dim": len(embeddings[0]),
-            "model": "Qwen3.5-9B (Fox)",
+            "model": model_name,
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
             "n_pass": sum(1 for l in labels if l == "PASS"),
             "n_fail": sum(1 for l in labels if l == "FAIL"),
@@ -337,6 +367,12 @@ def main():
     # Save new model
     torch.save(model.state_dict(), old_path)
     print(f"  Saved new model to {old_path}")
+    from geometric_lens.calibration import (
+        derive_cx_normalization, save_cx_normalization,
+    )
+    calibration = derive_cx_normalization(pass_mean, fail_mean)
+    calibration_path = save_cx_normalization(MODELS_DIR, calibration)
+    print(f"  Saved C(x) calibration to {calibration_path}")
 
     # Save stats
     stats = {
@@ -347,7 +383,7 @@ def main():
         "n_pass": sum(1 for l in labels if l == "PASS"),
         "n_fail": sum(1 for l in labels if l == "FAIL"),
         "dim": len(embeddings[0]),
-        "model": "Qwen3.5-9B (Fox)",
+        "model": model_name,
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
     }
     stats_path = os.path.join(MODELS_DIR, "retrain_stats.json")
@@ -356,7 +392,7 @@ def main():
     print(f"  Saved stats to {stats_path}")
 
     # Hot reload
-    print("\n  Attempting hot reload via RAG API...")
+    print("\n  Attempting hot reload via Geometric Lens...")
     try:
         req = Request("http://localhost:31144/internal/lens/reload",
                        method="POST",

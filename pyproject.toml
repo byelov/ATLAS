@@ -1,8 +1,8 @@
 [project]
 name = "atlas"
-version = "3.1.0"
+version = "3.1.2"
 description = "Adaptive Test-time Learning and Autonomous Specialization"
-license = "LicenseRef-ATLAS-Source-Available-1.0"
+license = "AGPL-3.0-or-later"
 requires-python = ">=3.9"
 authors = [{name = "Isaac"}]
 
@@ -11,7 +11,6 @@ atlas = "atlas.cli.repl:run"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-collect_ignore = ["tests/v1_archived"]
 
 [build-system]
 requires = ["setuptools>=64"]

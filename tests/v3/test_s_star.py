@@ -1,8 +1,7 @@
 """Tests for V3 S* Tiebreaking (Feature 2C) — Distinguishing Input Generation."""
 
 import json
-from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Optional, Tuple
 
 import pytest
 

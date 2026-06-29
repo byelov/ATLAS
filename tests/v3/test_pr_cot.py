@@ -1,8 +1,7 @@
 """Tests for V3 PR-CoT (Feature 3C) — Multi-Perspective Repair."""
 
 import json
-from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Optional, Tuple
 
 import pytest
 

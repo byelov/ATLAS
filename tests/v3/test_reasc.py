@@ -1,8 +1,6 @@
 """Tests for V3 ReASC (Feature 2B) — Early Stopping via Token Confidence."""
 
 import json
-import math
-from pathlib import Path
 
 import pytest
 
@@ -13,7 +11,6 @@ from benchmark.v3.reasc import (
     compute_bottom_10_confidence,
     should_early_stop,
 )
-from benchmark.v3.budget_forcing import normalize_energy
 
 
 # ---------------------------------------------------------------------------

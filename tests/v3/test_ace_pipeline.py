@@ -838,8 +838,8 @@ class TestKillPrinciple:
     def test_cascade_kill_children(self, ace_enabled):
         parent = ace_enabled.learn("parent", task_id="t1")
         child = ace_enabled.derive([parent.entry_id], "child", task_id="t2")
-        grandchild = ace_enabled.derive([child.entry_id], "grandchild", task_id="t3")
-        # Kill parent should cascade to child and grandchild
+        # grandchild is created for the cascade, then checked via kill count.
+        _ = ace_enabled.derive([child.entry_id], "grandchild", task_id="t3")
         killed = ace_enabled.kill_principle(parent.entry_id)
         assert killed == 3
         assert ace_enabled.playbook_size == 0
@@ -847,7 +847,8 @@ class TestKillPrinciple:
     def test_kill_preserves_unrelated(self, ace_enabled):
         a = ace_enabled.learn("principle a", task_id="t1")
         b = ace_enabled.learn("principle b", task_id="t2")
-        child_a = ace_enabled.derive([a.entry_id], "child of a", task_id="t3")
+        # child_a is created so the kill count reflects parent+child cascade.
+        _ = ace_enabled.derive([a.entry_id], "child of a", task_id="t3")
         killed = ace_enabled.kill_principle(a.entry_id)
         assert killed == 2  # a + child_a
         assert ace_enabled.playbook_size == 1  # b survives
@@ -874,7 +875,8 @@ class TestRecordFailure:
 
     def test_auto_kill_cascades(self, ace_enabled):
         parent = ace_enabled.learn("bad parent", task_id="t1")
-        child = ace_enabled.derive([parent.entry_id], "child", task_id="t2")
+        # child created so the kill count reflects the parent+child cascade.
+        _ = ace_enabled.derive([parent.entry_id], "child", task_id="t2")
         ace_enabled.record_failure(parent.entry_id)
         ace_enabled.record_failure(parent.entry_id)
         killed = ace_enabled.record_failure(parent.entry_id)

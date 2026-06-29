@@ -1,0 +1,69 @@
+# ATLAS docker-compose override for AMD ROCm / HIP backend.
+#
+# Bring up the stack with both files:
+#   docker compose -f docker-compose.yml -f docker-compose.rocm.yml up -d
+#
+# Only llama-server differs between backends (it's the only GPU-using
+# service). The geometric-lens, v3-service, sandbox, and atlas-proxy
+# containers are all CPU-only and unchanged.
+#
+# Hardware prereqs on the host:
+#   * AMD GPU with ROCm 6.x support, or RDNA4 (gfx1200/gfx1201) with
+#     ROCm 7.x via ATLAS_ROCM_TAG (see Dockerfile.rocm for gfx targets,
+#     and TROUBLESHOOTING.md § RDNA4 for the ROCm 7.x path)
+#   * /dev/kfd and /dev/dri/* accessible to the docker daemon's user
+#   * `video` and `render` groups exist (default on most distros)
+#
+# Verify with: docker info | grep -i runtime
+#   Should list "runc" as the default — ROCm doesn't need a separate
+#   runtime (unlike nvidia-container-toolkit for CUDA).
+
+services:
+  llama-server:
+    # Pull / build the ROCm-built image, not the CUDA one.
+    image: ghcr.io/${ATLAS_GHCR_OWNER:-itigges22}/atlas-llama-rocm:${ATLAS_IMAGE_TAG:-latest}
+    build:
+      context: ./inference
+      dockerfile: Dockerfile.rocm
+      args:
+        # Trim GFX_TARGET to your specific GPU for a smaller image. The
+        # default is a fat build covering RDNA3/RDNA2/CDNA2 — handy for
+        # the V3.1.1 community-test pass where we don't know the
+        # tester's exact card up front.
+        GFX_TARGET: ${ATLAS_GFX_TARGET:-gfx1100;gfx1101;gfx1102;gfx1030;gfx90a}
+        ROCM_TAG: ${ATLAS_ROCM_TAG:-6.2-complete}
+    # Wipe the NVIDIA driver request from the base file. The `!reset`
+    # YAML tag is a Compose-specific extension (v2.24+) that clears a
+    # value inherited from a previous file rather than merging with it.
+    # Without this, Compose would keep the {driver: nvidia, ...} entry
+    # from docker-compose.yml even though we want ROCm's /dev/kfd path.
+    # See: https://docs.docker.com/compose/compose-file/13-merge/#reset-value
+    deploy:
+      resources:
+        reservations:
+          devices: !reset []
+    devices:
+      # /dev/kfd — Kernel Fusion Driver, the HSA queue interface ROCm
+      # uses for compute. Required.
+      - /dev/kfd
+      # /dev/dri — DRM render nodes. ROCm uses the render nodes for
+      # buffer allocation and command submission to the GPU.
+      - /dev/dri
+    # Container user needs membership in `video` and `render` groups
+    # on the host so /dev/kfd and /dev/dri are accessible. Most distros
+    # ship these groups by default; if missing, add them with:
+    #   sudo groupadd -f render && sudo groupadd -f video
+    group_add:
+      - video
+      - render
+    environment:
+      # Make sure the entrypoint takes the ROCm branch even when .env
+      # is stale (older deployments from before `atlas init` wrote
+      # ATLAS_BACKEND).
+      - ATLAS_BACKEND=rocm
+      - ATLAS_GPU_INDEX=${ATLAS_GPU_INDEX:-0}
+      - ATLAS_HSA_OVERRIDE_GFX_VERSION=${ATLAS_HSA_OVERRIDE_GFX_VERSION:-}
+
+  # geometric-lens, v3-service, sandbox, atlas-proxy: no override
+  # needed — all CPU-only services. They keep the base-file definition
+  # unchanged. The override merge leaves them alone.

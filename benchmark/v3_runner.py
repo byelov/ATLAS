@@ -24,7 +24,7 @@ Orchestrates the full V3 pipeline on LiveCodeBench:
         - 3F: Metacognitive compensations
         - 3B: Constraint refinement
         - 3D: Derivation chains (if complex)
-        - 3E: Loop orchestration (max 5 iterations)
+        - 3E: Loop orchestration (max 2 iterations)
       - 3G: ACE learning from successes
 
 Telemetry: results/<run_id>/telemetry/v3_events.jsonl
@@ -43,7 +43,7 @@ import urllib.error
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 # Force line-buffered stdout
 sys.stdout.reconfigure(line_buffering=True)
@@ -52,14 +52,15 @@ sys.stdout.reconfigure(line_buffering=True)
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from benchmark.config import config
-from benchmark.models import BenchmarkTask, AttemptResult, TaskResult
+from benchmark.llm_client import chat_completion, chatml_to_messages
+from benchmark.models import BenchmarkTask
 from benchmark.runner import BenchmarkRunner, LLMConnectionError, extract_code
 from benchmark.runner import execute_code, execute_code_stdio
 from benchmark.geo_learning import extract_embedding_urllib
 from benchmark.best_of_k import score_candidate
 
 # V3 components
-from benchmark.v3.budget_forcing import BudgetForcing, BudgetForcingConfig, extract_thinking
+from benchmark.v3.budget_forcing import BudgetForcing, BudgetForcingConfig
 from benchmark.v3.plan_search import PlanSearch, PlanSearchConfig
 from benchmark.v3.div_sampling import DivSampling, DivSamplingConfig
 from benchmark.v3.blend_asc import BlendASC, BlendASCConfig
@@ -85,15 +86,17 @@ from benchmark.v3.ace_pipeline import ACEPipeline, ACEConfig
 from benchmark.v3.self_test_gen import SelfTestGen, SelfTestGenConfig
 from benchmark.v3.lens_feedback import LensFeedbackCollector, LensFeedbackConfig
 from benchmark.v3.candidate_selection import (
-    CandidateInfo, select_candidate, STRATEGIES,
+    CandidateInfo, select_candidate,
 )
 from benchmark.v3.embedding_store import EmbeddingWriter
 
 
 # --- Constants ----------------------------------------------------------------
 
-RAG_API_URL = os.environ.get("RAG_API_URL", "http://localhost:31144")
-LLAMA_URL = os.environ.get("LLAMA_URL", f"http://localhost:{config._conf.get('ATLAS_LLAMA_NODEPORT', '32735')}")
+# Resolved from .env (Docker) / atlas.conf (K3s) / explicit env var — see
+# BenchmarkConfig.llama_url / .rag_url. No deployment-specific port hardcoding.
+RAG_API_URL = config.rag_url
+LLAMA_URL = config.llama_url
 # Published Qwen3.5 benchmarks use: temp=0.6, top_k=20, top_p=0.95,
 # max_tokens=32768+, thinking mode enabled. Match their settings.
 MAX_TOKENS = 8192
@@ -187,6 +190,7 @@ def find_completed_tasks(phase_dir):
                     if 'task_id' in data:
                         completed.add(data['task_id'])
             except (json.JSONDecodeError, IOError):
+                # best-effort: swallow on failure (caller continues)
                 pass
     return completed
 
@@ -221,30 +225,25 @@ def self_verify_execute(results: List[Tuple[bool, str, str]],
 
 
 class LLMAdapter:
-    """Adapts BenchmarkRunner._call_llm to the V3 LLMCallable signature.
+    """Adapts BenchmarkRunner to the V3 LLMCallable signature:
+    (prompt, temperature, max_tokens, seed) -> (response, tokens, time_ms).
 
-    V3 components expect: (prompt, temperature, max_tokens, seed) -> (response, tokens, time_ms)
-    The prompt is already ChatML-formatted by the V3 components.
+    The prompt may be a ChatML string assembled by V3 components or raw text;
+    it is normalized to chat messages and sent through the shared client, so the
+    model's own chat template applies.
 
-    Budget Forcing enforcement: if the model's <think> block consumes >80%
-    of the token budget and no useful output remains, the call is retried
-    with /nothink injected into the prompt. This prevents infinite reasoning
-    from starving code generation.
-
-    Request serialization: DeltaNet hybrid architecture (Qwen3.5-9B) hangs
-    when multiple slots generate simultaneously via cont-batching. A class-level
-    lock ensures only one /completion request is in-flight at a time, giving
-    full single-slot throughput (~47 tok/s) while keeping 4 slots for connection
-    acceptance and prompt caching.
+    Request serialization: some hybrid architectures hang when multiple slots
+    generate concurrently via cont-batching. A class-level lock serializes
+    generation by default; set ATLAS_LLM_PARALLEL=1 to allow concurrent calls
+    (requires --no-cache-prompt on llama-server to prevent checkpoint-restore
+    hang).
     """
 
-    # Thinking consumes too much if it's >80% of tokens and output is tiny
     THINK_BUDGET_RATIO = 0.80
     MIN_OUTPUT_CHARS = 50
 
-    # Serialize LLM requests to avoid DeltaNet multi-slot generation hang.
-    # Set ATLAS_LLM_PARALLEL=1 to disable the lock (requires --no-cache-prompt
-    # on llama-server to prevent checkpoint restore hang).
+    # Serialize generation by default to avoid concurrent multi-slot hangs.
+    # Set ATLAS_LLM_PARALLEL=1 to disable the lock.
     _llm_lock = threading.Lock()
     _parallel_mode = os.environ.get("ATLAS_LLM_PARALLEL", "0") == "1"
 
@@ -263,150 +262,57 @@ class LLMAdapter:
         self.total_tokens = 0
         self.last_logprobs: List[float] = []
 
-    @staticmethod
-    def _parse_logprobs(data: dict) -> List[float]:
-        """Extract per-token log-probabilities from llama-server response.
-
-        Handles both /v1/chat/completions format (choices[0].logprobs)
-        and legacy /completion format (completion_probabilities).
-        """
-        logprobs = []
-        # /v1/chat/completions format
-        choices = data.get("choices", [])
-        if choices:
-            lp_data = choices[0].get("logprobs", {})
-            if lp_data and lp_data.get("content"):
-                for tok in lp_data["content"]:
-                    lp = tok.get("logprob")
-                    if lp is not None:
-                        logprobs.append(lp)
-                return logprobs
-
-        # Legacy /completion format fallback
-        for tok in data.get("completion_probabilities", []):
-            probs = tok.get("probs", [])
-            if probs:
-                p = probs[0].get("prob", 0.0)
-                if p > 0:
-                    logprobs.append(math.log(p))
-        return logprobs
-
-    def _send_request(self, request_body: dict) -> dict:
-        """Send request to LLM server with retry.
-
-        Supports both llama.cpp (/completion) and Fox (/v1/completions).
-        Uses manual ChatML formatting for thinking mode control.
-        """
-        # Detect Fox vs llama.cpp: Fox uses /v1/completions with OpenAI format
-        use_fox = os.environ.get("ATLAS_USE_FOX", "0") == "1"
-        if use_fox:
-            endpoint = f"{self.runner.llm_url}/v1/completions"
-            # Convert llama.cpp format to OpenAI format
-            if "n_predict" in request_body:
-                request_body["max_tokens"] = request_body.pop("n_predict")
-            request_body.pop("cache_prompt", None)
-            request_body.pop("n_probs", None)
-            request_body.setdefault("model", os.environ.get("ATLAS_MODEL_NAME", "default"))
-        else:
-            endpoint = f"{self.runner.llm_url}/completion"
-
-        last_error = None
-        max_attempts = self.max_retries + 3
-        for attempt in range(max_attempts):
-            try:
-                req = urllib.request.Request(
-                    endpoint,
-                    data=json.dumps(request_body).encode('utf-8'),
-                    headers={'Content-Type': 'application/json'}
-                )
-                if LLMAdapter._parallel_mode:
-                    with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                        return json.loads(resp.read().decode('utf-8'))
-                else:
-                    with LLMAdapter._llm_lock:
-                        with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                            return json.loads(resp.read().decode('utf-8'))
-            except urllib.error.HTTPError as e:
-                last_error = e
-                if e.code == 503 and attempt < max_attempts - 1:
-                    time.sleep(2 * (attempt + 1))
-                    continue
-                if attempt < max_attempts - 1:
-                    time.sleep(10 * (2 ** min(attempt, 3)))
-            except (ConnectionError, OSError, urllib.error.URLError) as e:
-                last_error = e
-                if attempt < max_attempts - 1:
-                    time.sleep(5 * (attempt + 1))
-            except Exception as e:
-                last_error = e
-                if attempt < max_attempts - 1:
-                    time.sleep(10 * (2 ** min(attempt, 3)))
-        raise LLMConnectionError(
-            f"LLM call failed after {max_attempts} retries: {last_error}"
-        )
-
     def __call__(self, prompt: str, temperature: float,
                  max_tokens: int, seed: Optional[int]) -> Tuple[str, int, float]:
         self.call_count += 1
 
-        # With --jinja enabled on llama-server, the model naturally uses
-        # <think>...</think> tags for reasoning via the /completion endpoint.
-        # No pre-fill needed — the chat template handles thinking mode.
+        # `prompt` may be a ChatML string (from phase modules) or raw text;
+        # chatml_to_messages() normalizes it so the model's own template applies.
+        # Generation is serialized unless ATLAS_LLM_PARALLEL=1 (see class docs).
+        messages = chatml_to_messages(prompt)
 
-        request_body = {
-            "prompt": prompt,
-            "temperature": temperature,
-            "n_predict": max_tokens,
-            "stream": False,
-            "cache_prompt": False,
-            "stop": ["\n\n\n\n"],
-            "n_probs": 1,
-            "top_k": 20,
-            "top_p": 0.95,
-        }
-        if seed is not None:
-            request_body["seed"] = seed
+        # Thinking on/off follows the system prompt's own ask (the
+        # LLMCallable contract is positional, so there's no kwarg to carry
+        # a tier). Prompts that instruct the model to think get thinking;
+        # structured/concise prompts stay off. Note this is a deliberate
+        # narrowing vs pre-migration, where thinking defaulted ON for any
+        # prompt without an in-text /nothink — analysis/decomposition/
+        # constraint prompts incidentally thought; they are now off because
+        # thinking wastes tokens on structured output:
+        #   budget_forcing think tiers   -> "Think step by step"
+        #   pr_cot repair                -> "Think carefully about the root cause"
+        #   refinement_loop code-gen     -> "Think through the approach"
+        #   derivation_chains code-gen   -> "Think carefully about the approach/how to combine"
+        #   nothink / analysis / constraint prompts carry no think-language.
+        # Reword those prompts and this marker list together.
+        system_text = " ".join(m.get("content", "") for m in messages
+                               if m.get("role") == "system").lower()
+        enable_thinking = ("think step by step" in system_text
+                           or "think carefully" in system_text
+                           or "think through" in system_text)
 
-        start_time = time.time()
-        data = self._send_request(request_body)
+        def _generate():
+            return chat_completion(
+                self.runner.llm_url,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                seed=seed,
+                enable_thinking=enable_thinking,
+                want_logprobs=True,
+                timeout=self.timeout,
+            )
 
-        # Parse response — Fox returns OpenAI format, llama.cpp returns legacy
-        if "choices" in data:
-            # Fox / OpenAI format
-            content = data["choices"][0].get("text", "")
-            tokens = data.get("usage", {}).get("completion_tokens", 0)
+        if LLMAdapter._parallel_mode:
+            r = _generate()
         else:
-            # llama.cpp legacy format
-            content = data.get("content", "")
-            tokens = data.get("tokens_predicted", 0)
-        self.last_logprobs = self._parse_logprobs(data)
+            with LLMAdapter._llm_lock:
+                r = _generate()
 
-        # Strip thinking blocks. With --jinja, the model wraps reasoning
-        # in <think>...</think> tags naturally. Strip them to get clean code.
-        content = re.sub(r'<think>.*?</think>\s*', '', content, flags=re.DOTALL)
-
-        # Handle orphaned </think> (from nothink pre-fill or partial output)
-        if '</think>' in content and '<think>' not in content:
-            content = content[content.index('</think>') + len('</think>'):].strip()
-
-        # Handle unclosed <think> (token budget exhausted during thinking)
-        if '<think>' in content:
-            after_think = content[content.index('<think>') + len('<think>'):].strip()
-            before_think = content[:content.index('<think>')].strip()
-            after_has_code = '```' in after_think or 'def ' in after_think or 'class ' in after_think
-            before_has_code = '```' in before_think or 'def ' in before_think or 'class ' in before_think
-            if after_has_code and not before_has_code:
-                content = after_think
-            elif before_has_code and not after_has_code:
-                content = before_think
-            elif after_has_code and before_has_code:
-                content = after_think if len(after_think) > len(before_think) else before_think
-            else:
-                content = ""
-
-        t_ms = (time.time() - start_time) * 1000
+        self.last_logprobs = r["logprobs"]
+        tokens = r["tokens"]
         self.total_tokens += tokens
-        return content, tokens, t_ms
+        return r["content"], tokens, r["time_ms"]
 
 
 class SandboxAdapter:
@@ -604,6 +510,7 @@ class V3Pipeline:
                 "ATLAS_V3_LENS_FEEDBACK_RETRAIN_INTERVAL", "50",
             ))
         except Exception:
+            # best-effort: swallow on failure (caller continues)
             pass
         return v3
 
@@ -798,6 +705,7 @@ class V3Pipeline:
                 label = "PASS" if probe_passed_sandbox else "FAIL"
                 self._emb_writer.write(task_id, 0, label, emb)
             except Exception:
+                # best-effort: swallow on failure (caller continues)
                 pass
             result["telemetry"]["probe_sandbox_passed"] = probe_passed_sandbox
 
@@ -865,6 +773,7 @@ class V3Pipeline:
                 categories = self._infer_categories(task)
                 ace_context = self.ace.get_context(categories, task_id=task_id)
             except Exception:
+                # best-effort: swallow on failure (caller continues)
                 pass
 
         # Generate constraint-diverse candidates via PlanSearch
@@ -1007,6 +916,7 @@ class V3Pipeline:
                     categories, task_id=task_id,
                 )
             except Exception:
+                # best-effort: swallow on failure (caller continues)
                 pass
 
         latency["phase1_gen_ms"] = (time.time() - phase1_start) * 1000
@@ -1043,6 +953,7 @@ class V3Pipeline:
                 label = "PASS" if cand.get("passed") else "FAIL"
                 self._emb_writer.write(task_id, cand["index"], label, emb)
             except Exception:
+                # best-effort: swallow on failure (caller continues)
                 pass
             return cand
 
@@ -1368,6 +1279,7 @@ class V3Pipeline:
                     task_id=task_id,
                 )
         except Exception:
+            # best-effort: swallow on failure (caller continues)
             pass
 
     def _build_generation_prompt(self, task: BenchmarkTask,
@@ -1439,6 +1351,7 @@ class V3Pipeline:
         try:
             append_jsonl(self.telemetry_dir / "v3_events.jsonl", event)
         except Exception:
+            # best-effort: swallow on failure (caller continues)
             pass
 
     def collect_benchmark_results(self, results: Dict[str, Dict]) -> None:
@@ -1458,6 +1371,7 @@ class V3Pipeline:
             llm = LLMAdapter(self.runner)
             self.metacognitive.analyze_benchmark(benchmark_results, llm_call=llm)
         except Exception:
+            # best-effort: swallow on failure (caller continues)
             pass
 
 
@@ -1520,6 +1434,7 @@ class V3BenchmarkRunner:
                     data = json.load(fh)
                     results[data['task_id']] = data
             except Exception:
+                # best-effort: swallow on failure (caller continues)
                 pass
 
         parallel_tasks = int(os.environ.get("ATLAS_PARALLEL_TASKS", "4"))
@@ -1532,8 +1447,9 @@ class V3BenchmarkRunner:
         else:
             self._run_serial(remaining, results, per_task_dir, total, done)
 
-        # Save phase summary (done counter updated by reference via results dict)
-        done = len(results)
+        # Save phase summary — `done` was tracked here historically for
+        # progress logging; the value now flows through summary["total_tasks"]
+        # below, so the standalone local was dead.
         passed = sum(1 for r in results.values() if r.get("passed"))
         summary = {
             "phase": phase_name,
@@ -1699,15 +1615,15 @@ def run_v3_benchmark(run_id=None, smoke_only=False, max_tasks=None,
     except Exception as e:
         print(f"  llama-server: FAILED ({e})")
         print("  Aborting benchmark — llama-server not reachable")
-        return None
+        sys.exit(1)
 
     try:
         req = urllib.request.Request(f"{RAG_API_URL}/health")
         with urllib.request.urlopen(req, timeout=5) as resp:
             data = json.loads(resp.read().decode('utf-8'))
-        print(f"  RAG API: OK ({data.get('status', '?')})")
+        print(f"  Geometric Lens: OK ({data.get('status', '?')})")
     except Exception:
-        print("  RAG API: WARNING — lens scoring unavailable")
+        print("  Geometric Lens: WARNING — lens scoring unavailable")
 
     # Check Lens model availability (retry once after short delay)
     lens_ok = False

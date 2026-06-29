@@ -26,7 +26,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
-from .budget_forcing import BudgetForcing, BudgetForcingConfig, get_system_prompt
+from benchmark.llm_client import strip_reasoning_leak
+
+from .budget_forcing import BudgetForcing, get_system_prompt
 
 
 # ---------------------------------------------------------------------------
@@ -298,10 +300,9 @@ def extract_code_from_response(response: str) -> str:
 
     Handles: ```python blocks, ``` blocks, <think> blocks, raw code.
     """
-    # Strip thinking blocks
-    response = re.sub(r'<think>.*?</think>', '', response, flags=re.DOTALL).strip()
-    if '<think>' in response and '</think>' not in response:
-        response = response[:response.index('<think>')].strip()
+    # Strip any reasoning leak via the shared, model-agnostic helper (handles
+    # both closed <think>...</think> blocks and orphaned closing tags).
+    response = strip_reasoning_leak(response)
 
     # Try ```python blocks
     py_blocks = re.findall(r'```python\s*\n(.*?)```', response, re.DOTALL)
@@ -397,7 +398,7 @@ class PlanSearch:
 
         # Step 2: Plan Construction (parallel across constraint sets)
         plans: List[Plan] = [None] * len(constraint_sets)
-        step2_tokens_list = [0] * len(constraint_sets)
+        [0] * len(constraint_sets)
 
         def _build_plan(i, cs):
             plan, tokens, t = self._step2_construct_plan(
@@ -575,4 +576,5 @@ class PlanSearch:
             with open(self._events_file, "a") as f:
                 f.write(json.dumps(event.to_dict()) + "\n")
         except OSError:
+            # best-effort: swallow on failure (caller continues)
             pass

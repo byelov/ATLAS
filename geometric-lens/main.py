@@ -1,22 +1,20 @@
-import hashlib
 import logging
 import json
 import os
 import uuid
 from datetime import datetime, timezone
-from typing import List, Dict, Any, Optional, AsyncGenerator
+from typing import List, Dict, Any, Optional
 from fastapi import FastAPI, HTTPException, Header, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, asdict
 from enum import Enum
 
 import redis
 import httpx
-from config import config
-from storage import project_store, ProjectMetadata
+from config import config, api_keys
+from storage import project_store
 from pipeline import (
     rag_enhanced_completion, simple_completion, forward_to_llama_stream,
     invalidate_cache,
@@ -27,6 +25,40 @@ from indexer.tree_builder import build_tree_from_files
 from indexer.bm25_index import BM25Index
 from indexer.summarizer import summarize_tree, collect_summaries
 from indexer.persistence import save_index, load_index, delete_index
+
+
+# ---------------------------------------------------------------------------
+# Logging + HTTP-response sanitization helpers
+# ---------------------------------------------------------------------------
+#
+# Untrusted strings (request bodies, file content, exception messages
+# that wrap user data) can contain CR/LF and other control chars that
+# fake additional log entries when written verbatim. _safe_log() strips
+# those and bounds length so a single log line stays one line.
+#
+# For HTTP responses, _safe_detail() returns a short generic message
+# while logging the real exception internally with a correlation ID.
+# Useful for endpoints where leaking exception text would expose
+# filesystem paths or internal types to a remote caller.
+def _safe_log(value: object, maxlen: int = 200) -> str:
+    """Render a value for inclusion in a log line. Strips CR/LF and
+    other ASCII control chars, truncates to maxlen."""
+    s = str(value)
+    s = "".join(c for c in s if c == "\t" or 0x20 <= ord(c) < 0x7f or ord(c) > 0x9f)
+    if len(s) > maxlen:
+        s = s[:maxlen] + "…"
+    return s
+
+
+def _safe_detail(e: Exception, op: str = "operation") -> str:
+    """Log the real exception with a correlation ID; return a generic
+    detail string safe to send in an HTTP response. Use for endpoints
+    where exposing str(e) would leak internal paths / types."""
+    err_id = uuid.uuid4().hex[:12]
+    logger.error(f"[err {err_id}] {op} failed: {type(e).__name__}: {_safe_log(e)}",
+                 exc_info=True)
+    return f"{op} failed (error_id={err_id})"
+
 
 # Redis for task queue
 REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379")
@@ -43,10 +75,113 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+# Boot-time self-test cache. Populated in lifespan(); read by /health and /ready.
+# Keys: lens_enabled, lens_cost_field_loaded, lens_cost_field_dim, lens_gx_loaded,
+#       lens_gx_type, lens_cx_calibrated, lens_gx_calibrated, lens_artifact_model,
+#       embed_dim,
+#       self_test_pass, self_test_error.
+_BOOT_STATE: Dict[str, Any] = {
+    "lens_enabled": False,
+    "lens_cost_field_loaded": False,
+    "lens_cost_field_dim": None,
+    "lens_gx_loaded": False,
+    "lens_gx_type": "none",
+    "lens_cx_calibrated": False,
+    "lens_gx_calibrated": False,
+    "lens_artifact_model": None,
+    "embed_dim": None,
+    "self_test_pass": False,
+    "self_test_error": None,
+}
+
+
+def _run_lens_self_test() -> None:
+    """Boot-time C(x)/G(x) self-test.
+
+    Loads weights, fetches a dummy embedding from llama-server, checks the
+    cost-field input dim matches the embedding dim (the silent killer
+    behind PC-018), and runs a single C(x) evaluation. Populates
+    _BOOT_STATE so /health and /ready can report what actually works.
+    Never raises — failures are recorded and surfaced via /ready 503.
+    """
+    from geometric_lens import service as lens_service
+
+    _BOOT_STATE["lens_enabled"] = lens_service.is_enabled()
+    if not lens_service.is_enabled():
+        _BOOT_STATE["self_test_error"] = "GEOMETRIC_LENS_ENABLED is false"
+        return
+
+    try:
+        loaded = lens_service._ensure_models_loaded()
+        info = lens_service.get_model_info()
+        _BOOT_STATE["lens_cost_field_loaded"] = bool(info.get("loaded"))
+        _BOOT_STATE["lens_gx_loaded"] = bool(info.get("gx_loaded"))
+        _BOOT_STATE["lens_gx_type"] = info.get("gx_type", "none")
+        _BOOT_STATE["lens_cx_calibrated"] = bool(info.get("cx_calibrated"))
+        _BOOT_STATE["lens_gx_calibrated"] = bool(info.get("gx_calibrated"))
+        _BOOT_STATE["lens_artifact_model"] = info.get("artifact_model")
+        if not loaded:
+            _BOOT_STATE["self_test_error"] = info.get("error") or (
+                "lens model files missing — run `atlas lens build`"
+            )
+            return
+
+        cf = lens_service._cost_field
+        if cf is not None:
+            cf_dim = next(cf.parameters()).shape[1] if hasattr(cf, "parameters") else None
+            _BOOT_STATE["lens_cost_field_dim"] = cf_dim
+
+        from geometric_lens.embedding_extractor import extract_embedding
+        emb = extract_embedding("def add(a, b): return a + b")
+        _BOOT_STATE["embed_dim"] = len(emb)
+
+        cf_dim = _BOOT_STATE["lens_cost_field_dim"]
+        if cf_dim is not None and cf_dim != len(emb):
+            _BOOT_STATE["self_test_error"] = (
+                f"lens/embedding dim mismatch: cost_field expects {cf_dim}, "
+                f"llama-server returned {len(emb)} (likely wrong model file — see PC-018)"
+            )
+            return
+
+        raw, norm = lens_service.evaluate_energy("def add(a, b): return a + b")
+        if raw == 0.0 and norm == 0.0:
+            _BOOT_STATE["self_test_error"] = "C(x) evaluation returned zeros"
+            return
+
+        _BOOT_STATE["self_test_pass"] = True
+        logger.info(
+            "Lens self-test OK: cf_dim=%s embed_dim=%s C(x)_raw=%.2f norm=%.3f gx=%s",
+            cf_dim, len(emb), raw, norm, _BOOT_STATE["lens_gx_type"],
+        )
+    except Exception as e:
+        _BOOT_STATE["self_test_error"] = f"{type(e).__name__}: {e}"
+        logger.error("Lens self-test failed: %s", _BOOT_STATE["self_test_error"])
+
+
+def _redis_state() -> Dict[str, Any]:
+    if redis_client is None:
+        return {"connected": False, "error": "client not initialised"}
+    try:
+        redis_client.ping()
+        return {"connected": True}
+    except Exception as e:
+        return {"connected": False, "error": f"{type(e).__name__}: {e}"}
+
+
+def _llama_state() -> Dict[str, Any]:
+    url = config.llama.base_url.rstrip("/") + "/health"
+    try:
+        with httpx.Client(timeout=2.0) as client:
+            r = client.get(url)
+        return {"reachable": r.status_code == 200, "status_code": r.status_code}
+    except Exception as e:
+        return {"reachable": False, "error": f"{type(e).__name__}: {e}"}
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup and shutdown events."""
-    logger.info("RAG API starting up")
+    logger.info("Geometric Lens API starting up")
     logger.info(f"Llama server: {config.llama.base_url}")
 
     # Cleanup expired projects on startup
@@ -59,15 +194,23 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"Failed to load seed patterns: {e}")
 
+    # Boot-time C(x)/G(x) self-test. Records state; never raises.
+    _run_lens_self_test()
+    if _BOOT_STATE["lens_enabled"] and not _BOOT_STATE["self_test_pass"]:
+        logger.error(
+            "Geometric Lens enabled but self-test FAILED: %s. /ready will return 503.",
+            _BOOT_STATE["self_test_error"],
+        )
+
     yield
 
-    logger.info("RAG API shutting down")
+    logger.info("Geometric Lens API shutting down")
 
 
 app = FastAPI(
-    title="RAG API",
-    description="RAG-enhanced API for code-aware LLM interactions",
-    version="1.0.0",
+    title="Geometric Lens API",
+    description="Geometric Lens API for code-aware LLM interactions with RAG, Pattern Cache, and Confidence Router",
+    version="3.0.1",
     lifespan=lifespan
 )
 
@@ -84,61 +227,20 @@ app.add_middleware(
 )
 
 
-# API Key validation cache (in-memory, short-lived)
-_key_cache: Dict[str, dict] = {}
-_key_cache_ttl = 60  # seconds
-
-
-async def validate_key_with_portal(api_key: str) -> Optional[dict]:
-    """Validate API key with the API portal service."""
-    import time
-
-    # Check cache first
-    cached = _key_cache.get(api_key)
-    if cached and time.time() - cached["timestamp"] < _key_cache_ttl:
-        return cached["data"]
-
-    # Call portal validation endpoint
-    portal_url = config.api_portal_url
-    try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            response = await client.post(
-                f"{portal_url}/api/validate-key",
-                json={"api_key": api_key}
-            )
-            if response.status_code == 200:
-                data = response.json()
-                if data.get("valid"):
-                    # Cache the result
-                    _key_cache[api_key] = {
-                        "timestamp": time.time(),
-                        "data": data
-                    }
-                    return data
-    except Exception as e:
-        logger.warning(f"Failed to validate key with portal: {e}")
-        # Fall through to check if it's a legacy key
-
-    return None
-
-
-# Auth dependency
+# Auth dependency — local key file lookup, no remote portal.
 async def verify_api_key(authorization: str = Header(None)) -> str:
-    """Verify API key from Authorization header."""
+    """Verify the bearer token against the locally-loaded api-keys.json."""
     if not authorization:
         raise HTTPException(status_code=401, detail="Missing Authorization header")
 
-    # Extract key from "Bearer sk-xxx" format
     parts = authorization.split()
     if len(parts) != 2 or parts[0].lower() != "bearer":
         raise HTTPException(status_code=401, detail="Invalid Authorization format")
 
     key = parts[1]
-
-    # Validate with API portal
-    validation = await validate_key_with_portal(key)
-    if validation:
-        logger.info(f"API key validated for user: {validation.get('user')}")
+    metadata = api_keys.get(key)
+    if metadata is not None:
+        logger.info(f"API key validated for user: {metadata.get('user', 'unknown')}")
         return key
 
     raise HTTPException(status_code=401, detail="Invalid API key")
@@ -194,16 +296,76 @@ class ChatRequest(BaseModel):
 # Endpoints
 @app.get("/health")
 async def health():
-    """Health check endpoint."""
-    return {"status": "healthy", "service": "geometric-lens"}
+    """Structured per-subsystem health.
+
+    Always returns 200 — this endpoint is for *information*, not gating.
+    Use /ready for liveness/scoring-functional gating.
+    """
+    redis_st = _redis_state()
+    llama_st = _llama_state()
+    lens_ok = (
+        not _BOOT_STATE["lens_enabled"] or _BOOT_STATE["self_test_pass"]
+    )
+    overall = (
+        redis_st["connected"]
+        and llama_st["reachable"]
+        and lens_ok
+    )
+    return {
+        "service": "geometric-lens",
+        "status": "healthy" if overall else "degraded",
+        "subsystems": {
+            "redis": redis_st,
+            "llama_server": llama_st,
+            "lens": {
+                "enabled": _BOOT_STATE["lens_enabled"],
+                "cost_field_loaded": _BOOT_STATE["lens_cost_field_loaded"],
+                "cost_field_dim": _BOOT_STATE["lens_cost_field_dim"],
+                "embed_dim": _BOOT_STATE["embed_dim"],
+                "gx_loaded": _BOOT_STATE["lens_gx_loaded"],
+                "gx_type": _BOOT_STATE["lens_gx_type"],
+                "cx_calibrated": _BOOT_STATE["lens_cx_calibrated"],
+                "gx_calibrated": _BOOT_STATE["lens_gx_calibrated"],
+                "artifact_model": _BOOT_STATE["lens_artifact_model"],
+                "self_test_pass": _BOOT_STATE["self_test_pass"],
+                "self_test_error": _BOOT_STATE["self_test_error"],
+            },
+        },
+    }
+
+
+@app.get("/ready")
+async def ready():
+    """Readiness gate. 200 only when scoring is functional, 503 otherwise.
+
+    Use this for orchestrator probes that should pull traffic away when
+    lens scoring degrades (the silent-failure mode PC-019 was filed for).
+    """
+    redis_st = _redis_state()
+    llama_st = _llama_state()
+    lens_required = _BOOT_STATE["lens_enabled"]
+    lens_ok = (not lens_required) or _BOOT_STATE["self_test_pass"]
+
+    ok = redis_st["connected"] and llama_st["reachable"] and lens_ok
+    payload = {
+        "ready": ok,
+        "redis": redis_st["connected"],
+        "llama_server": llama_st["reachable"],
+        "lens_self_test": _BOOT_STATE["self_test_pass"],
+        "lens_required": lens_required,
+        "reason": _BOOT_STATE["self_test_error"] if not lens_ok else None,
+    }
+    if not ok:
+        raise HTTPException(status_code=503, detail=payload)
+    return payload
 
 
 @app.get("/")
 async def root():
     """Root endpoint."""
     return {
-        "service": "RAG API",
-        "version": "1.0.0",
+        "service": "Geometric Lens API",
+        "version": "3.0.1",
         "endpoints": {
             "sync": "POST /v1/projects/sync",
             "chat": "POST /v1/chat/completions",
@@ -623,27 +785,17 @@ class PatternWriteRequest(BaseModel):
     success: bool = True
 
 
-@app.post("/v1/patterns/write")
-async def write_pattern(
-    request: PatternWriteRequest,
-    api_key: str = Depends(verify_api_key),
-):
-    """
-    Write path: Extract and store a pattern from a successful task completion.
-    This is called after a task passes tests.
-    Runs async — returns immediately, extraction happens in background.
-    """
+def _dispatch_pattern_write(request: PatternWriteRequest) -> dict:
+    """Schedule pattern-write + outcome recording. Shared by /v1 and /internal handlers."""
     import asyncio
 
     if not request.success:
-        # Record failure outcome for any active patterns
         if request.active_pattern_ids:
             asyncio.create_task(
                 record_pattern_outcome(request.active_pattern_ids, success=False)
             )
         return {"status": "recorded_failure"}
 
-    # Fire-and-forget: extract pattern in background
     asyncio.create_task(
         write_pattern_async(
             query=request.query,
@@ -656,13 +808,32 @@ async def write_pattern(
         )
     )
 
-    # Record success outcome for active patterns
     if request.active_pattern_ids:
         asyncio.create_task(
             record_pattern_outcome(request.active_pattern_ids, success=True)
         )
 
     return {"status": "accepted", "message": "Pattern extraction started in background"}
+
+
+@app.post("/v1/patterns/write")
+async def write_pattern(
+    request: PatternWriteRequest,
+    api_key: str = Depends(verify_api_key),
+):
+    """Auth-gated write path for external clients. See `_dispatch_pattern_write`."""
+    return _dispatch_pattern_write(request)
+
+
+@app.post("/internal/patterns/write")
+async def write_pattern_internal(request: PatternWriteRequest):
+    """Unauthenticated write path for in-stack service-to-service calls (v3-service).
+
+    Mirrors `/v1/patterns/write` exactly but skips the bearer-token check, in
+    line with the rest of the `/internal/*` surface (lens, sandbox, cache stats).
+    Only reachable from inside the docker network in normal deployments.
+    """
+    return _dispatch_pattern_write(request)
 
 
 @app.get("/internal/cache/stats")
@@ -832,6 +1003,14 @@ class LensScoreTextRequest(BaseModel):
     text: str
 
 
+class LensScorePerStepRequest(BaseModel):
+    text: str
+    # Optional transformer-block index. None => last-layer (vanilla /embedding,
+    # no PC-202 patch needed). Set to use the PC-202 layers extension and score
+    # at the residual stream of a specific intermediate layer (PC-204 fusion).
+    layer: Optional[int] = None
+
+
 @app.post("/internal/lens/score-text")
 async def lens_score_text(request: LensScoreTextRequest):
     """Score a text string through the Geometric Lens. Returns raw and normalized energy."""
@@ -853,11 +1032,14 @@ async def lens_score_text(request: LensScoreTextRequest):
         with torch.no_grad():
             energy = lens_service._cost_field(x).item()
 
-        # Fox 9B retrained: PASS ~13.2, FAIL ~24.9, midpoint ~19.0
-        normalized = 1.0 / (1.0 + 2.718 ** (-(energy - 19.0) / 2.0))
-        normalized = min(1.0, max(0.0, normalized))
+        normalized = lens_service._normalize_cx_energy(energy)
 
-        return {"energy": energy, "normalized": normalized, "enabled": True}
+        return {
+            "energy": energy,
+            "normalized": normalized,
+            "calibrated": lens_service._cx_normalization is not None,
+            "enabled": True,
+        }
     except Exception as e:
         logger.error(f"Lens score-text failed: {e}")
         return {"energy": 0.0, "normalized": 0.5, "error": str(e)}
@@ -915,6 +1097,14 @@ async def lens_retrain(request: LensRetrainRequest):
             domain=request.domain,
         )
 
+        if not metrics.get("skipped", False):
+            from geometric_lens.calibration import (
+                derive_cx_normalization, save_cx_normalization,
+            )
+            calibration = derive_cx_normalization(
+                metrics["pass_energy_mean"], metrics["fail_energy_mean"])
+            save_cx_normalization(models_dir, calibration)
+
         # Remove non-serializable 'model' key from metrics
         metrics.pop("model", None)
 
@@ -965,6 +1155,7 @@ async def lens_gx_score(request: LensScoreTextRequest):
         if not is_enabled():
             return {
                 "cx_energy": 0.0, "cx_normalized": 0.5,
+                "cx_calibrated": False,
                 "gx_score": 0.5, "verdict": "unavailable",
                 "enabled": False, "gx_available": False,
             }
@@ -974,7 +1165,57 @@ async def lens_gx_score(request: LensScoreTextRequest):
         logger.error(f"Lens gx-score failed: {e}")
         return {
             "cx_energy": 0.0, "cx_normalized": 0.5,
+            "cx_calibrated": False,
             "gx_score": 0.5, "verdict": "error",
+            "error": str(e),
+        }
+
+
+@app.post("/internal/lens/score-per-step")
+async def lens_score_per_step(request: LensScorePerStepRequest):
+    """PC-207 lens-as-PRM: score every token in the text instead of pooling.
+
+    Returns C(x) and (when XGBoost is loaded) G(x) per generation step,
+    plus aggregates across the whole sequence. Used by V3 candidate
+    generation to abort off-rails candidates early instead of paying the
+    full decode cost — the lens stops being ORM-by-timing (scores
+    completed text) and becomes PRM-by-timing.
+
+    Set `layer` to use the PC-202 hidden-states extension and score the
+    residual stream at a specific intermediate layer (PC-204). Leave
+    `layer` null to use the model's last-layer hidden state via vanilla
+    /embedding (works on unpatched llama-server).
+    """
+    try:
+        from geometric_lens.service import evaluate_per_step, is_enabled
+
+        if not is_enabled():
+            return {
+                "enabled": False, "gx_available": False,
+                "per_step": [], "aggregate": {}, "n_tokens": 0,
+            }
+
+        result = evaluate_per_step(request.text, layer=request.layer)
+        agg = result.get("aggregate") or {}
+        # _safe_log on the request.layer value strips CRLF + truncates
+        # so user input can't fake a separate log entry. The other args
+        # are floats/ints from result — structurally safe.
+        logger.info(
+            "lens score-per-step: in_chars=%d n_tok=%d gx_min=%.3f gx_mean=%.3f off_rails=%d layer=%s lat=%.0fms",
+            len(request.text or ""),
+            int(result.get("n_tokens", 0)),
+            float(agg.get("gx_score_min", 0.0)),
+            float(agg.get("gx_score_mean", 0.0)),
+            int(agg.get("first_off_rails_idx", -1)),
+            _safe_log(request.layer) if request.layer is not None else "last",
+            float(result.get("latency_ms", 0.0)),
+        )
+        return result
+    except Exception as e:
+        logger.error(f"Lens score-per-step failed: {e}")
+        return {
+            "enabled": True, "gx_available": False,
+            "per_step": [], "aggregate": {}, "n_tokens": 0,
             "error": str(e),
         }
 

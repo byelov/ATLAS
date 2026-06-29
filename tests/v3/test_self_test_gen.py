@@ -2,7 +2,6 @@
 """Tests for V3 Self-Test Generation."""
 
 import json
-from pathlib import Path
 from typing import Optional, Tuple
 
 import pytest
@@ -11,11 +10,8 @@ from benchmark.v3.self_test_gen import (
     SelfTestGenConfig,
     SelfTestGen,
     GeneratedTestCase,
-    SelfTestResult,
     _strip_think_tags,
     _strip_markdown_fences,
-    _parse_structured_blocks,
-    _parse_numbered_blocks,
 )
 
 

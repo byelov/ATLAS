@@ -1,0 +1,124 @@
+# syntax=docker/dockerfile:1.4
+# ATLAS llama-server inference image — AMD ROCm / HIP backend.
+#
+# Parallel to Dockerfile.v31 (NVIDIA CUDA). Same llama.cpp build with the
+# HIP backend instead of CUDA, same PC-202 hidden-states patch, same
+# entrypoint contract. Bring up via:
+#   docker compose -f docker-compose.yml -f docker-compose.rocm.yml up -d
+#
+# Tested target: AMD Radeon RX 7900 XTX (gfx1100). Smoke-tested by
+# community contributor (issue #26). For full V3.1.1 release, the
+# default GFX_TARGET below is a fat build covering RDNA3 (7000 series),
+# RDNA2 (6000 series), and CDNA2 (MI200 series) so a single image
+# works on most AMD GPUs ATLAS users are likely to bring.
+#
+# Override at build time for a leaner image:
+#   docker build --build-arg GFX_TARGET=gfx1100 -f Dockerfile.rocm .
+
+ARG ROCM_TAG=6.2-complete
+FROM docker.io/rocm/dev-ubuntu-22.04:${ROCM_TAG} AS builder
+
+# AMD GPU compute target(s) — semicolon-separated. Each adds ~150 MB to
+# the binary. Trim to your GPU for a smaller image, or keep the fat
+# default for portability. Reference (LLVM AMDGPU processors):
+#   RDNA3 — gfx1100 (7900 XT/XTX), gfx1101 (7800/7700), gfx1102 (7600)
+#   RDNA2 — gfx1030 (6800/6900),  gfx1031 (6700),     gfx1032 (6600)
+#   CDNA2 — gfx90a  (MI210/250/250X)
+#   CDNA3 — gfx940/gfx942 (MI300A/X)
+#   Vega  — gfx900  (older, may need separate build)
+ARG GFX_TARGET=gfx1100;gfx1101;gfx1102;gfx1030;gfx90a
+
+# Ubuntu base, not RHEL — apt instead of dnf for build deps. ccache
+# is added so the cmake build below can persist compiled object files
+# across LLAMA_CPP_REV bumps (#117).
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        git cmake build-essential ccache ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+# Use /llama.cpp/tmp for build temp to avoid /tmp space exhaustion.
+ENV TMPDIR=/llama.cpp/tmp
+
+# Patches applied to llama.cpp before build. Keep this stage cache-friendly:
+# patches changes -> rebuild; everything else stays cached.
+COPY patches/ /patches/
+
+# Pin llama.cpp to a known-good SHA (same rationale as Dockerfile.v31 —
+# upstream context drift breaks the PC-202 patch periodically). Keep
+# this aligned with the other Dockerfiles.
+ARG LLAMA_CPP_REV=2e97c5f96f9fe2bb26f794a348e05d7a1c74baa1
+# #117: Split fetch -> patch -> build into three RUN layers so a
+# LLAMA_CPP_REV bump or a patches/ change invalidates only the affected
+# layer. ccache mount (below) further mitigates SHA bumps by caching
+# compiled object files keyed on source content hash.
+
+# 1. Fetch llama.cpp at the pinned SHA. Invalidated by LLAMA_CPP_REV.
+#    See docs/TROUBLESHOOTING.md "llama.cpp clone times out".
+RUN git init /llama.cpp && \
+    cd /llama.cpp && \
+    git remote add origin https://github.com/ggml-org/llama.cpp && \
+    git -c http.postBuffer=524288000 \
+        -c http.lowSpeedLimit=1000 \
+        -c http.lowSpeedTime=60 \
+        fetch --depth 1 origin ${LLAMA_CPP_REV} && \
+    git checkout FETCH_HEAD && \
+    mkdir -p /llama.cpp/tmp
+
+# 2. Apply patches. Invalidated by /patches contents OR LLAMA_CPP_REV.
+RUN cd /llama.cpp && \
+    sed -i '/auto params_dft = params_base;/a\        params_dft.embedding = false;  // ATLAS: draft never needs embeddings' \
+        tools/server/server-context.cpp 2>/dev/null || true && \
+    git apply --check /patches/expose-hidden-states.patch && \
+    git apply         /patches/expose-hidden-states.patch
+
+# 3. Build with HIP/ROCm + ccache mount (#117).
+#    GGML_HIP=ON enables the AMD backend (was GGML_HIPBLAS in older).
+#    CMAKE_C/CXX_COMPILER=hipcc is required so the HIP kernels compile.
+#    AMDGPU_TARGETS scopes which gfx targets are baked into the binary.
+#    Note: ccache wraps hipcc the same way it wraps gcc/g++ — the
+#    HIP compiler invocations are normal cc-style commands with HIP
+#    kernels passed as source.
+RUN --mount=type=cache,id=llama-ccache,target=/root/.ccache,sharing=locked \
+    cd /llama.cpp && \
+    cmake -B build \
+        -DGGML_HIP=ON \
+        -DAMDGPU_TARGETS="${GFX_TARGET}" \
+        -DCMAKE_C_COMPILER=/opt/rocm/bin/hipcc \
+        -DCMAKE_CXX_COMPILER=/opt/rocm/bin/hipcc \
+        -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+        -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+        -DBUILD_SHARED_LIBS=OFF && \
+    cmake --build build --config Release -j5 && \
+    ccache --show-stats || true
+
+# ---------------------------------------------------------------------------
+# Runtime stage — same ROCm base image. There is no slim 'runtime'
+# variant in the ROCm Docker registry that's as cleanly separated as
+# NVIDIA's runtime/devel split, so we reuse the dev image. Image size
+# is comparable to nvidia/cuda:12.9.0-runtime-rockylinux9 (~5–6 GB).
+# Could be slimmed in V3.1.2 by switching to rocm/rocm-terminal once
+# we confirm it ships the HIP runtime libs llama-server needs.
+# ---------------------------------------------------------------------------
+FROM docker.io/rocm/dev-ubuntu-22.04:${ROCM_TAG}
+
+COPY --from=builder /llama.cpp/build/bin/llama-server /usr/local/bin/
+COPY --from=builder /llama.cpp/build/bin/llama-cli /usr/local/bin/
+# Ship cvector-generator alongside llama-server so the bootstrap can run
+# the ASA steering-vector build (BiasBusters #4) as a one-shot container
+# without needing a separate llama.cpp install on the host. Same as the
+# CUDA image — the ASA workflow is backend-agnostic at the file level.
+COPY --from=builder /llama.cpp/build/bin/llama-cvector-generator /usr/local/bin/
+
+RUN mkdir -p /models /templates
+COPY templates/ /templates/
+COPY entrypoint-v3.1.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+# The HIP runtime needs the calling user in the `render` and `video`
+# groups on the host for /dev/kfd + /dev/dri access. The compose
+# override (docker-compose.rocm.yml) handles the device passthrough +
+# group_add. No USER directive here — entrypoint runs as root inside
+# the container; kernel-side permission check is on host.
+
+EXPOSE 8000
+ENTRYPOINT ["/entrypoint.sh"]

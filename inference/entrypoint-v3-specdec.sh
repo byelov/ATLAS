@@ -25,11 +25,38 @@ TEMPLATE="${CHAT_TEMPLATE:-Qwen3-custom.jinja}"
 PARALLEL="${PARALLEL_SLOTS:-2}"
 DRAFT_MODEL="${DRAFT_MODEL:-/models/Qwen3-0.6B-Q8_0.gguf}"
 
-export GGML_CUDA_NO_PINNED="${GGML_CUDA_NO_PINNED:-0}"
-export CUDA_DEVICE_MAX_CONNECTIONS="${CUDA_DEVICE_MAX_CONNECTIONS:-1}"
-export CUDA_MODULE_LOADING="${CUDA_MODULE_LOADING:-LAZY}"
+# Backend-specific runtime tuning (V3.1.1 multi-backend). Mirrors the
+# block in entrypoint-v3.1.sh; speculative decoding is currently
+# untested on ROCm — the draft-model path may need additional tuning.
+ATLAS_BACKEND="${ATLAS_BACKEND:-cuda}"
+case "$ATLAS_BACKEND" in
+  cuda)
+    export GGML_CUDA_NO_PINNED="${GGML_CUDA_NO_PINNED:-0}"
+    export CUDA_DEVICE_MAX_CONNECTIONS="${CUDA_DEVICE_MAX_CONNECTIONS:-1}"
+    export CUDA_MODULE_LOADING="${CUDA_MODULE_LOADING:-LAZY}"
+    if [ -n "$ATLAS_GPU_INDEX" ] && [ -z "$CUDA_VISIBLE_DEVICES" ]; then
+      export CUDA_VISIBLE_DEVICES="$ATLAS_GPU_INDEX"
+    fi
+    ;;
+  rocm)
+    export GGML_CUDA_NO_PINNED="${GGML_CUDA_NO_PINNED:-0}"
+    if [ -n "$ATLAS_GPU_INDEX" ] && [ -z "$HIP_VISIBLE_DEVICES" ]; then
+      export HIP_VISIBLE_DEVICES="$ATLAS_GPU_INDEX"
+      export ROCR_VISIBLE_DEVICES="${ROCR_VISIBLE_DEVICES:-$ATLAS_GPU_INDEX}"
+    fi
+    if [ -n "$ATLAS_HSA_OVERRIDE_GFX_VERSION" ]; then
+      export HSA_OVERRIDE_GFX_VERSION="$ATLAS_HSA_OVERRIDE_GFX_VERSION"
+    fi
+    ;;
+  *)
+    export GGML_CUDA_NO_PINNED="${GGML_CUDA_NO_PINNED:-0}"
+    export CUDA_DEVICE_MAX_CONNECTIONS="${CUDA_DEVICE_MAX_CONNECTIONS:-1}"
+    export CUDA_MODULE_LOADING="${CUDA_MODULE_LOADING:-LAZY}"
+    ;;
+esac
 
 echo "=== V3: Generation + Self-Embeddings + Speculative Decoding ==="
+echo "  Backend: $ATLAS_BACKEND${ATLAS_GPU_INDEX:+ (GPU index=$ATLAS_GPU_INDEX)}"
 echo "  Context: $CTX_LENGTH (draft: $DRAFT_CTX) | KV: $KV_CACHE_TYPE | Parallel: $PARALLEL"
 echo "  Embeddings: ENABLED (5120-dim Qwen3 self-embeddings)"
 echo "  Draft model: $DRAFT_MODEL"

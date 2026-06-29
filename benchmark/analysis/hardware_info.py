@@ -9,7 +9,7 @@ import os
 import platform
 import subprocess
 import re
-from typing import Dict, Any, Optional
+from typing import Dict, Any
 
 from ..models import HardwareInfo
 from ..config import config
@@ -41,59 +41,65 @@ def run_command(cmd: str, default: str = "") -> str:
 
 def get_gpu_info() -> Dict[str, Any]:
     """
-    Get GPU information using nvidia-smi.
+    Get GPU information using whichever vendor SMI tool is present.
+
+    V3.1.1: vendor-aware. Returns vendor + model + VRAM + driver version
+    + power draw. Power draw is NVIDIA-only (rocm-smi power reporting
+    varies wildly by card and isn't reliable enough to use in benchmark
+    metadata).
 
     Returns:
-        Dictionary with GPU model, VRAM, driver version, and power draw
+        Dictionary with model, vendor, vram_gb, driver_version, power_draw_watts
     """
     info = {
         "model": "",
+        "vendor": "",
         "vram_gb": 0.0,
         "driver_version": "",
         "power_draw_watts": 0.0
     }
 
-    # Try nvidia-smi
-    nvidia_smi = run_command("which nvidia-smi")
-    if not nvidia_smi:
-        return info
+    # Vendor-agnostic detection via tier — keeps the SMI parsing logic
+    # in one place (tier.py) rather than duplicated across files.
+    try:
+        from atlas.cli.commands import tier
+        gpus = tier.detect_gpu()
+    except Exception:
+        gpus = []
+    primary = None
+    for g in gpus:
+        if primary is None or g.vram_gb > primary.vram_gb:
+            primary = g
+    if primary is not None:
+        info["model"] = primary.name
+        info["vendor"] = primary.vendor
+        info["vram_gb"] = round(primary.vram_gb, 2)
 
-    # Get GPU name
-    name = run_command("nvidia-smi --query-gpu=name --format=csv,noheader,nounits")
-    if name:
-        info["model"] = name.split('\n')[0].strip()
-
-    # Get VRAM
-    vram = run_command("nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits")
-    if vram:
-        try:
-            # Convert MiB to GB
-            info["vram_gb"] = float(vram.split('\n')[0].strip()) / 1024
-        except ValueError:
-            pass
-
-    # Get driver version
-    driver = run_command("nvidia-smi --query-gpu=driver_version --format=csv,noheader,nounits")
-    if driver:
-        info["driver_version"] = driver.split('\n')[0].strip()
-
-    # Get current power draw
-    power = run_command("nvidia-smi --query-gpu=power.draw --format=csv,noheader,nounits")
-    if power:
-        try:
-            info["power_draw_watts"] = float(power.split('\n')[0].strip())
-        except ValueError:
-            pass
-
+    # Per-vendor extras (driver version, power draw) — keep these inline
+    # since benchmark metadata wants per-vendor specifics.
+    if info["vendor"] == "nvidia":
+        driver = run_command("nvidia-smi --query-gpu=driver_version --format=csv,noheader,nounits")
+        if driver:
+            info["driver_version"] = driver.split('\n')[0].strip()
+        power = run_command("nvidia-smi --query-gpu=power.draw --format=csv,noheader,nounits")
+        if power:
+            try:
+                info["power_draw_watts"] = float(power.split('\n')[0].strip())
+            except ValueError:
+                # best-effort: swallow on failure (caller continues)
+                pass
+    elif info["vendor"] == "amd":
+        # rocm-smi --showdriverversion prints "ROCm Driver Version: 6.x.x"
+        out = run_command("rocm-smi --showdriverversion")
+        m = re.search(r'Driver Version:\s*([\d.]+)', out)
+        if m:
+            info["driver_version"] = m.group(1)
     return info
 
 
 def get_cuda_version() -> str:
     """
-    Get CUDA version.
-
-    Returns:
-        CUDA version string
+    Get CUDA version (NVIDIA only — returns "" on non-NVIDIA hosts).
     """
     # Try nvcc first
     nvcc_version = run_command("nvcc --version | grep release | sed 's/.*release //' | sed 's/,.*//'")
@@ -106,6 +112,30 @@ def get_cuda_version() -> str:
     if match:
         return match.group(1)
 
+    return ""
+
+
+def get_rocm_version() -> str:
+    """
+    Get ROCm version (AMD only — returns "" on non-AMD hosts).
+
+    Tries hipcc, then rocm-smi --version, then /opt/rocm/.info/version.
+    """
+    # hipcc — bundled with ROCm dev
+    hipcc = run_command("hipcc --version 2>&1 | head -1")
+    m = re.search(r'HIP version:\s*([\d.]+)', hipcc)
+    if m:
+        return m.group(1)
+    # rocm-smi --version
+    smi = run_command("rocm-smi --version 2>&1 | head -1")
+    m = re.search(r'ROCm[\s-]*[Vv]ersion:\s*([\d.]+)', smi) or \
+        re.search(r'([\d]+\.[\d]+\.[\d]+)', smi)
+    if m:
+        return m.group(1)
+    # Last resort: /opt/rocm/.info/version on most installs
+    version_file = run_command("cat /opt/rocm/.info/version 2>/dev/null")
+    if version_file:
+        return version_file.strip()
     return ""
 
 
@@ -207,7 +237,7 @@ def get_model_info() -> Dict[str, str]:
     quantization = ""
 
     # Extract quantization from model filename
-    # e.g., "Qwen3-14B-Q4_K_M.gguf" -> "Q4_K_M"
+    # e.g., "Qwen3.5-9B-Q6_K.gguf" -> "Q6_K"
     match = re.search(r'(Q\d+_K(?:_[A-Z])?)', model_name, re.IGNORECASE)
     if match:
         quantization = match.group(1).upper()
@@ -230,11 +260,16 @@ def collect_hardware_info() -> HardwareInfo:
     os_info = get_os_info()
     model_info = get_model_info()
 
+    vendor = gpu_info.get("vendor", "")
     return HardwareInfo(
         gpu_model=gpu_info["model"],
         gpu_vram_gb=gpu_info["vram_gb"],
+        gpu_vendor=vendor,
         gpu_driver_version=gpu_info["driver_version"],
-        cuda_version=get_cuda_version(),
+        # Populate the vendor-specific compute runtime field; leave the
+        # other empty so JSON consumers can switch on vendor cleanly.
+        cuda_version=get_cuda_version() if vendor == "nvidia" else "",
+        rocm_version=get_rocm_version() if vendor == "amd" else "",
         cpu_model=cpu_info["model"],
         cpu_cores=cpu_info["cores"],
         ram_gb=get_memory_info(),
@@ -259,15 +294,31 @@ def hardware_info_to_markdown(info: HardwareInfo) -> str:
     Returns:
         Formatted Markdown string
     """
+    # Show whichever compute-runtime line applies to the detected vendor.
+    # On NVIDIA hosts: CUDA line + power draw. On AMD: ROCm line, no power
+    # (rocm-smi power reporting is too inconsistent to publish in benchmark
+    # metadata). Apple/Intel/unknown: skip both, just show vendor tag.
+    if info.gpu_vendor == "nvidia":
+        runtime_line = f"- CUDA: {info.cuda_version or 'N/A'}"
+        power_line = (f"- Power Draw: {info.power_draw_watts:.0f}W"
+                      if info.power_draw_watts else "- Power Draw: N/A")
+    elif info.gpu_vendor == "amd":
+        runtime_line = f"- ROCm: {info.rocm_version or 'N/A'}"
+        power_line = "- Power Draw: N/A (rocm-smi power not reported)"
+    else:
+        runtime_line = f"- Runtime: N/A (vendor={info.gpu_vendor or 'unknown'})"
+        power_line = "- Power Draw: N/A"
+
     lines = [
         "## Hardware Information",
         "",
         "### GPU",
         f"- Model: {info.gpu_model or 'N/A'}",
+        f"- Vendor: {info.gpu_vendor or 'N/A'}",
         f"- VRAM: {info.gpu_vram_gb:.1f} GB" if info.gpu_vram_gb else "- VRAM: N/A",
         f"- Driver: {info.gpu_driver_version or 'N/A'}",
-        f"- CUDA: {info.cuda_version or 'N/A'}",
-        f"- Power Draw: {info.power_draw_watts:.0f}W" if info.power_draw_watts else "- Power Draw: N/A",
+        runtime_line,
+        power_line,
         "",
         "### CPU",
         f"- Model: {info.cpu_model or 'N/A'}",

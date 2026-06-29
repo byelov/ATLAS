@@ -1,8 +1,6 @@
 """Tests for V3 Constraint Refinement (Feature 3B)."""
 
 import json
-import math
-from pathlib import Path
 from typing import List, Optional, Tuple
 
 import pytest

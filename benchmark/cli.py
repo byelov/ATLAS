@@ -20,15 +20,12 @@ Usage:
 import argparse
 import json
 import logging
-import os
 import shutil
-import sys
-import tempfile
 import time
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional, Set, Dict, Any
+from typing import List, Set, Dict, Any
 
 from .config import config
 from .models import BenchmarkTask, TaskResult, BenchmarkRun
@@ -39,7 +36,6 @@ from .datasets import (
     LiveCodeBenchDataset, SciCodeDataset,
 )
 from .analysis import calculate_pass_at_k, CostAnalyzer, collect_hardware_info
-from .analysis.hardware_info import hardware_info_to_markdown
 from .analysis.pass_at_k import compare_with_baseline
 
 
@@ -287,6 +283,7 @@ def run_benchmark_suite(
                         result = TaskResult.from_dict(data)
                         run.results[result.task_id] = result
             except (json.JSONDecodeError, IOError):
+                # best-effort: swallow on failure (caller continues)
                 pass
         logger.info(f"Loaded {len(run.results)} existing results from previous run(s)")
 
@@ -414,7 +411,7 @@ def analyze_results(input_dir: Path, output_dir: Path):
     # Generate combined report
     report_file = output_dir / "analysis_report.md"
     with open(report_file, 'w') as f:
-        f.write("# ATLAS V1 Benchmark Analysis Report\n\n")
+        f.write("# ATLAS Benchmark Analysis Report\n\n")
         f.write(f"Generated: {datetime.now().isoformat()}\n\n")
 
         for run_file in run_files:
@@ -457,7 +454,7 @@ def cost_analysis(input_dir: Path, output_dir: Path):
 
     report_file = output_dir / "cost_analysis.md"
     with open(report_file, 'w') as f:
-        f.write("# ATLAS V1 Cost Analysis\n\n")
+        f.write("# ATLAS Cost Analysis\n\n")
         f.write(f"Generated: {datetime.now().isoformat()}\n\n")
 
         for run_file in run_files:

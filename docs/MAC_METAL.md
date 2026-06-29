@@ -5,7 +5,7 @@ No Docker, no CUDA. Apple Silicon GPU via Metal.
 ## Stack at a glance
 
 ```
-atlas-proxy :8090  (Go)      ← grammar / agent loop / Aider format
+proxy :8090  (Go)            ← grammar / agent loop
      │
      └── llama-server :8080  (C++, Metal)  ← Qwen3.5-9B-Q6_K.gguf
      │
@@ -16,7 +16,7 @@ atlas-proxy :8090  (Go)      ← grammar / agent loop / Aider format
 
 Grammar-constrained decoding (`json_schema`) is **not a build flag** — it is part of
 llama.cpp's built-in server and works identically on Metal and CUDA.
-The atlas-proxy constructs the schema at request time ([atlas-proxy/grammar.go](../atlas-proxy/grammar.go)).
+The proxy constructs the schema at request time ([proxy/grammar.go](../proxy/grammar.go)).
 
 ---
 
@@ -201,9 +201,9 @@ pip install fastapi uvicorn pydantic
 python executor_server.py
 ```
 
-### atlas-proxy (Go)
+### proxy (Go)
 ```bash
-cd atlas-proxy
+cd proxy
 go build -o ~/.local/bin/atlas-proxy .
 atlas-proxy
 ```

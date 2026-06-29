@@ -17,6 +17,8 @@ CREATE_*.md
 AUDIT*.md
 *AUDIT*.md
 FINAL_CLEANUP.md
+# Local-only issue tracker (mirrored to GitHub Issues for public tracking).
+ISSUES.md
 DELETE_BEFORE_PUSH/
 /plans/
 docs/plans/
@@ -88,6 +90,7 @@ projects/
 *.crt
 .env
 .env.*
+!.env.example
 secrets/
 *secret*
 
@@ -128,8 +131,14 @@ embedding-service/
 templates/qdrant-deployment.yaml.tmpl
 templates/embedding-deployment.yaml.tmpl
 
+# ----- K3s render output -----
+# manifests/ is generated from templates/*.yaml.tmpl by
+# scripts/generate-manifests.sh (or install.sh's process_templates step) at
+# install time. Source of truth is templates/, not manifests/.
+manifests/
+
 # ----- Local data (not for git — user provides their own models) -----
-models/
+/models/
 
 # ----- Benchmark -----
 benchmark/datasets/.cache/
@@ -151,20 +160,28 @@ v2_5_1/
 
 # ATLAS workspace (sandbox staging, backups)
 .atlas/
-.aider*
-!.aider.model.settings.yml
-!.aider.model.metadata.json
+
+# /demo per-run sandbox dirs — kept on disk so you can review what each
+# side produced after recording; never checked in.
+.demo-raw-*/
+.demo-v3-*/
 
 # ----- Go build artifacts -----
-atlas-proxy/atlas-proxy-v2
-atlas-proxy/cmd/
+proxy/atlas-proxy
+proxy/atlas-proxy-v2
+proxy/cmd/
+tui/atlas-tui
 
 # ----- Geometric Lens large files (on HuggingFace, not in git) -----
 geometric-lens/geometric_lens/models/training_embeddings_*.json
 geometric-lens/geometric_lens/models/*_backup.pt
 geometric-lens/geometric_lens/models/cost_field_phase0.pt
 # Keep: cost_field.pt, metric_tensor.pt, gx_xgboost.pkl, gx_weights.json, stats files
-# Keep: geometric-lens/data/sample/ (small in-repo sample)
+# Keep: geometric-lens/data/sample/ (small in-repo sample). The broad
+# `data/` rule above would swallow it, so re-include the path chain.
+!geometric-lens/data/
+geometric-lens/data/*
+!geometric-lens/data/sample/
 
 # ----- Runtime artifacts -----
 *.pid
@@ -175,3 +192,7 @@ highscores.json
 geometric-lens/geometric_lens/gate_analysis.py
 geometric-lens/geometric_lens/gate_embeddings.json
 geometric-lens/geometric_lens/gate_report.json
+_agenttest/
+
+# Lens training corpus collected from agent use (local, per-machine)
+lens_training/
