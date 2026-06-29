@@ -123,10 +123,15 @@ if lsof -ti :8099 &>/dev/null; then
     sleep 1
 fi
 
+# OMP_NUM_THREADS=1 + KMP_DUPLICATE_LIB_OK: the lens loads torch (C(x)) then
+# xgboost (G(x)) in one process; on macOS their two libomp copies otherwise
+# clash and segfault at startup. Single-threaded OpenMP avoids it (xgboost
+# inference is cheap); C(x) is tiny so the thread cap costs nothing here.
 LLAMA_URL=http://localhost:8080 \
 LLAMA_EMBED_URL=http://localhost:8080 \
 GEOMETRIC_LENS_ENABLED=true \
 ATLAS_MODEL_NAME="$ATLAS_MODEL_NAME" \
+OMP_NUM_THREADS=1 KMP_DUPLICATE_LIB_OK=TRUE \
 PROJECT_DATA_DIR=/tmp/atlas-projects \
 REDIS_URL=redis://localhost:6379 \
   bash -c 'cd geometric-lens && exec python -m uvicorn main:app --host 0.0.0.0 --port 8099' \

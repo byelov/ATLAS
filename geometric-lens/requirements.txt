@@ -1,5 +1,7 @@
 numpy>=1.26
 xgboost>=2.0
+scikit-learn>=1.3   # G(x) trainer: train/test split + metrics (atlas lens build)
+safetensors>=0.4    # optional: pickle-free C(x) twin written alongside cost_field.pt
 fastapi==0.109.0
 uvicorn==0.27.0
 pydantic==2.5.3

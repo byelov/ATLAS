@@ -662,47 +662,87 @@ def _extract_training_embeddings(samples: List[Dict],
         except OSError:
             cache_fh = None
 
+    # Per-sample metadata (skip empty text), hashed for cache lookup.
+    meta = []  # (text, hash, label, weight, has_weight)
+    for s in samples:
+        text = s.get("text") or s.get("content") or ""
+        if not text:
+            continue
+        h = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        meta.append((text, h, int(s.get("label", 0)),
+                     float(s.get("weight", 1.0)), "weight" in s))
+
+    cached_keys = set(cache)
+    # Unique texts still needing an embedding — dedupe so identical candidates
+    # are embedded once, not once per occurrence.
+    to_embed = {}
+    for text, h, *_ in meta:
+        if h not in cache and h not in to_embed:
+            to_embed[h] = text
+
+    # Embed the misses concurrently — llama-server serves several slots in
+    # parallel, so sequential HTTP left most of them idle. Workers default to
+    # 4 (typical slot count); override with ATLAS_LENS_EMBED_WORKERS.
+    try:
+        workers = max(1, int(os.environ.get("ATLAS_LENS_EMBED_WORKERS", "4")))
+    except ValueError:
+        workers = 4
+    n_miss = len(to_embed)
+    if n_miss:
+        from concurrent.futures import ThreadPoolExecutor
+        import threading
+        lock = threading.Lock()
+        done = 0
+
+        def _embed_one(item):
+            h, text = item
+            vec, pieces = _embed_text(llama_url, text)
+            return h, vec, pieces
+
+        try:
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                for h, vec, pieces in ex.map(_embed_one, list(to_embed.items())):
+                    done += 1
+                    if vec is None:
+                        _safe_print(f"  WARN: embedding failed even after "
+                                    f"chunking — sample skipped")
+                        continue
+                    if pieces > 1:
+                        _safe_print(f"  one sample longer than the server's "
+                                    f"micro-batch — embedded as {pieces} "
+                                    f"chunks, mean-pooled")
+                    with lock:
+                        cache[h] = vec
+                        if cache_fh:
+                            cache_fh.write(jsonlib.dumps(
+                                {"h": h, "dim": len(vec), "v": vec}) + "\n")
+                            cache_fh.flush()
+                    if done % 25 == 0 or done == n_miss:
+                        _safe_print(f"  embedded {done}/{n_miss} fresh "
+                                    f"(x{workers} parallel)")
+        finally:
+            if cache_fh:
+                cache_fh.close()
+    elif cache_fh:
+        cache_fh.close()
+
+    # Assemble in original sample order; drop any that failed to embed.
     embeddings: List[List[float]] = []
     labels: List[int] = []
     weights: List[float] = []  # carried through aligned with kept samples
     saw_weight = False
-    n = len(samples)
     hits = 0
-    try:
-        for i, s in enumerate(samples):
-            text = s.get("text") or s.get("content") or ""
-            label = int(s.get("label", 0))
-            if not text:
-                continue
-            h = hashlib.sha256(text.encode("utf-8")).hexdigest()
-            vec = cache.get(h)
-            if vec is not None:
-                hits += 1
-            else:
-                vec, pieces = _embed_text(llama_url, text)
-                if vec is None:
-                    _safe_print(f"  WARN: sample {i+1}/{n}: embedding failed "
-                                f"even after chunking — skipped")
-                    continue
-                if pieces > 1:
-                    _safe_print(f"  sample {i+1}/{n}: longer than the "
-                                f"server's micro-batch — embedded as "
-                                f"{pieces} chunks, mean-pooled")
-                cache[h] = vec   # duplicate texts later in this run hit
-                if cache_fh:
-                    cache_fh.write(jsonlib.dumps(
-                        {"h": h, "dim": len(vec), "v": vec}) + "\n")
-                    cache_fh.flush()
-            embeddings.append(vec)
-            labels.append(label)
-            if "weight" in s:
-                saw_weight = True
-            weights.append(float(s.get("weight", 1.0)))
-            if (i + 1) % 25 == 0 or (i + 1) == n:
-                _safe_print(f"  extracted {i+1}/{n} embeddings")
-    finally:
-        if cache_fh:
-            cache_fh.close()
+    for text, h, label, weight, has_weight in meta:
+        vec = cache.get(h)
+        if vec is None:
+            continue
+        if h in cached_keys:
+            hits += 1
+        embeddings.append(vec)
+        labels.append(label)
+        if has_weight:
+            saw_weight = True
+        weights.append(weight)
     if hits:
         _safe_print(f"  ({hits} from cache, {len(embeddings) - hits} embedded "
                     f"fresh)")

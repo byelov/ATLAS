@@ -44,6 +44,40 @@ def build_pairs(embeddings, labels):
     return pairs
 
 
+def build_pair_indices(labels):
+    """Contrastive pairs as (pass_idx, fail_idx) into the embedding tensor.
+
+    The index form lets the training loop gather batches straight from one
+    pre-built device tensor (`emb[idx]`) instead of rebuilding a tensor from
+    Python lists every batch — the latter dominated wall-clock on CPU.
+    """
+    pass_idx = [i for i, l in enumerate(labels) if l == 1]
+    fail_idx = [i for i, l in enumerate(labels) if l == 0]
+    return [(p, f) for p in pass_idx for f in fail_idx]
+
+
+def select_device():
+    """Pick the C(x) training device. Default CPU; opt into an accelerator
+    with ATLAS_LENS_DEVICE=mps|cuda.
+
+    The vectorized batch path (one pre-staged tensor + index gather) already
+    makes CPU training fast — seconds, not minutes — so CPU is the safe
+    default. Apple's MPS backend gives a further speedup but has shown
+    intermittent segfaults on torch 2.11 in the full build pipeline, so it is
+    opt-in rather than automatic. CUDA is likewise opt-in.
+    """
+    pref = os.environ.get("ATLAS_LENS_DEVICE", "").strip().lower()
+    if pref == "mps":
+        if torch.backends.mps.is_available():
+            return torch.device("mps")
+        print("ATLAS_LENS_DEVICE=mps but MPS unavailable — using CPU")
+    elif pref == "cuda":
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        print("ATLAS_LENS_DEVICE=cuda but CUDA unavailable — using CPU")
+    return torch.device("cpu")
+
+
 def train_cost_field(
     data: dict,
     epochs: int = 200,
@@ -70,6 +104,18 @@ def train_cost_field(
     random.seed(seed)
     torch.manual_seed(seed)
 
+    # OMP_NUM_THREADS may be pinned to 1 (it must be, to keep xgboost's OpenMP
+    # from clashing with torch's libomp on macOS — a segfault). torch's own
+    # intra-op threadpool is independent of that env var, so set it explicitly
+    # to keep C(x) training multi-core. Override with ATLAS_LENS_THREADS.
+    try:
+        n_threads = int(os.environ.get("ATLAS_LENS_THREADS", "0"))
+    except ValueError:
+        n_threads = 0
+    if n_threads <= 0:
+        n_threads = max(1, os.cpu_count() or 4)
+    torch.set_num_threads(n_threads)
+
     embeddings = data["embeddings"]
     labels = data["labels"]
     dim = len(embeddings[0])
@@ -94,15 +140,23 @@ def train_cost_field(
     print(f"Train: {len(train_embs)} (PASS={sum(train_labels)}, FAIL={len(train_labels)-sum(train_labels)})")
     print(f"Test:  {len(test_embs)} (PASS={sum(test_labels)}, FAIL={len(test_labels)-sum(test_labels)})")
 
-    # Build contrastive pairs
-    train_pairs = build_pairs(train_embs, train_labels)
-    test_pairs = build_pairs(test_embs, test_labels)
-    print(f"Train pairs: {len(train_pairs)}, Test pairs: {len(test_pairs)}")
+    # Build contrastive pairs as indices into the embedding tensors, so each
+    # batch is a cheap gather from one pre-built device tensor rather than a
+    # fresh torch.tensor() from Python lists (the old per-batch hot path).
+    train_pair_idx = build_pair_indices(train_labels)
+    n_test_pairs = sum(1 for l in test_labels if l == 1) * \
+        sum(1 for l in test_labels if l == 0)
+    print(f"Train pairs: {len(train_pair_idx)}, Test pairs: {n_test_pairs}")
 
-    # Convert to tensors
-    device = torch.device("cpu")
+    device = select_device()
+    print(f"Training device: {device.type}")
     model = CostField(input_dim=dim).to(device)
     optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+
+    # Pre-stage all embeddings on the device once.
+    train_emb_t = torch.tensor(train_embs, dtype=torch.float32, device=device)
+    test_emb_t = torch.tensor(test_embs, dtype=torch.float32, device=device)
+    pair_idx_t = torch.tensor(train_pair_idx, dtype=torch.long, device=device)
 
     # Training loop
     loss_history = []
@@ -110,18 +164,27 @@ def train_cost_field(
     best_epoch = 0
     best_state = None
 
+    # Larger mini-batches turn each step into one big GEMM that BLAS spreads
+    # across all cores (small 32-pair batches only kept ~2 cores busy) and cut
+    # the per-epoch Python-loop count. Override with ATLAS_LENS_BATCH_SIZE.
+    try:
+        cfg_batch = int(os.environ.get("ATLAS_LENS_BATCH_SIZE", "1024"))
+    except ValueError:
+        cfg_batch = 1024
+    batch_size = max(1, min(cfg_batch, len(train_pair_idx)))
+    print(f"Batch size: {batch_size} (torch threads: {torch.get_num_threads()})")
+
     for epoch in range(epochs):
         model.train()
-        random.shuffle(train_pairs)
+        perm = torch.randperm(pair_idx_t.size(0), device=device)
+        epoch_pairs = pair_idx_t[perm]
         total_loss = 0.0
         n_batches = 0
 
-        # Mini-batch training (batch_size=32 pairs)
-        batch_size = min(32, len(train_pairs))
-        for batch_start in range(0, len(train_pairs), batch_size):
-            batch = train_pairs[batch_start:batch_start + batch_size]
-            pass_batch = torch.tensor([p[0] for p in batch], dtype=torch.float32, device=device)
-            fail_batch = torch.tensor([p[1] for p in batch], dtype=torch.float32, device=device)
+        for batch_start in range(0, epoch_pairs.size(0), batch_size):
+            bi = epoch_pairs[batch_start:batch_start + batch_size]
+            pass_batch = train_emb_t[bi[:, 0]]
+            fail_batch = train_emb_t[bi[:, 1]]
 
             c_pass = model(pass_batch)
             c_fail = model(fail_batch)
@@ -146,7 +209,7 @@ def train_cost_field(
         # readable.
         model.eval()  # Note: model.eval() is the PyTorch eval mode toggle, not code evaluation
         with torch.no_grad():
-            test_auc = compute_energy_auc(model, test_embs, test_labels, device)
+            test_auc = compute_energy_auc(model, test_emb_t, test_labels, device)
 
         if test_auc > best_test_auc:
             best_test_auc = test_auc
@@ -155,7 +218,7 @@ def train_cost_field(
 
         if (epoch + 1) % 20 == 0 or epoch == 0:
             with torch.no_grad():
-                train_auc = compute_energy_auc(model, train_embs, train_labels, device)
+                train_auc = compute_energy_auc(model, train_emb_t, train_labels, device)
             print(f"Epoch {epoch+1:4d} | Loss: {avg_loss:.4f} | Train AUC: {train_auc:.4f} | Test AUC: {test_auc:.4f}")
 
         if patience and (epoch + 1) - best_epoch >= patience:
@@ -170,11 +233,18 @@ def train_cost_field(
         print(f"Keeping best checkpoint: epoch {best_epoch} "
               f"(test AUC {best_test_auc:.4f})")
 
+    # Bring the model back to CPU before any save/serialize downstream —
+    # torch.save() of MPS tensors has segfaulted on torch 2.11.
+    model = model.to("cpu")
+    device = torch.device("cpu")
+    train_emb_t = train_emb_t.to("cpu")
+    test_emb_t = test_emb_t.to("cpu")
+
     # Final assessment
     model.eval()  # Note: model.eval() is the PyTorch eval mode toggle, not code evaluation
     with torch.no_grad():
-        final_train_auc = compute_energy_auc(model, train_embs, train_labels, device)
-        final_test_auc = compute_energy_auc(model, test_embs, test_labels, device)
+        final_train_auc = compute_energy_auc(model, train_emb_t, train_labels, device)
+        final_test_auc = compute_energy_auc(model, test_emb_t, test_labels, device)
 
         # Compute energy statistics
         all_pass = torch.tensor([e for e, l in zip(embeddings, labels) if l == 1],
@@ -207,9 +277,17 @@ def compute_energy_auc(model, embeddings, labels, device):
     """Compute AUC: does C(x) rank FAIL higher than PASS?
 
     Higher AUC = better separation (FAIL embeddings get higher energy).
+
+    `embeddings` may be a list of vectors or a pre-built tensor (preferred —
+    avoids rebuilding the tensor every epoch).
     """
-    X = torch.tensor(embeddings, dtype=torch.float32, device=device)
-    energies = model(X).squeeze().tolist()
+    if isinstance(embeddings, torch.Tensor):
+        X = embeddings.to(device)
+    else:
+        X = torch.tensor(embeddings, dtype=torch.float32, device=device)
+    # Move off the accelerator before .tolist() — reading scalars back from MPS
+    # element-by-element is both slow and a known crash source on torch 2.11.
+    energies = model(X).squeeze().detach().cpu().tolist()
 
     # AUC: probability that a random FAIL has higher energy than a random PASS
     pass_e = [e for e, l in zip(energies, labels) if l == 1]
