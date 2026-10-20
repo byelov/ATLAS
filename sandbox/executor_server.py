@@ -652,4 +652,5 @@ if __name__ == "__main__":
     import uvicorn
     WORKSPACE_BASE.mkdir(parents=True, exist_ok=True)
     logger.info(f"Supported languages: {list(LANGUAGE_HANDLERS.keys())}")
-    uvicorn.run(app, host="0.0.0.0", port=8020)
+    uvicorn.run(app, host=os.getenv("SANDBOX_HOST", "0.0.0.0"),
+                port=int(os.getenv("SANDBOX_PORT", "8020")))

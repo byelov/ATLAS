@@ -89,11 +89,13 @@ step "Building llama-server with Metal"
 
 bash scripts/build-llama-metal.sh
 
-# Symlink so llama-server is on PATH
+# Symlink so llama-server is on PATH (no sudo: /usr/local/bin may not
+# exist on Apple Silicon, and ~/.local/bin is already used for atlas-proxy)
 LLAMA_BIN="$HOME/llama.cpp/build/bin/llama-server"
 if [[ -x "$LLAMA_BIN" ]]; then
-    sudo ln -sf "$LLAMA_BIN" /usr/local/bin/llama-server
-    ok "llama-server symlinked to /usr/local/bin/llama-server"
+    mkdir -p "$HOME/.local/bin"
+    ln -sf "$LLAMA_BIN" "$HOME/.local/bin/llama-server"
+    ok "llama-server symlinked to ~/.local/bin/llama-server"
 fi
 
 # ── 6. Download model ────────────────────────────────────────────────────────

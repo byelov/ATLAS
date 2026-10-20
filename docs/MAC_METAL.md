@@ -89,9 +89,9 @@ echo 'export MODEL_PATH=$(python3 -c "from huggingface_hub import hf_hub_downloa
 ## 1 · Build llama-server with Metal
 
 ```bash
-bash scripts/build-llama-metal.sh
+bash scripts/build-llama-metal.sh   # builds the pinned llama.cpp revision
 # then optionally:
-sudo ln -sf ~/llama.cpp/build/bin/llama-server /usr/local/bin/llama-server
+mkdir -p ~/.local/bin && ln -sf ~/llama.cpp/build/bin/llama-server ~/.local/bin/llama-server
 ```
 
 What changed vs the CUDA Dockerfile:
@@ -108,13 +108,14 @@ What changed vs the CUDA Dockerfile:
 
 ```bash
 # No MODEL_PATH needed — auto-resolves from HF cache (unsloth/Qwen3.5-9B-GGUF)
-CONTEXT_LENGTH=65536 PARALLEL_SLOTS=4 bash inference/entrypoint-metal.sh
+# M1 Ultra 128 GB: 131072 total / 4 slots = 32 K per slot, f16 KV (the defaults in run-mac.sh)
+CONTEXT_LENGTH=131072 PARALLEL_SLOTS=4 bash inference/entrypoint-metal.sh
 ```
 
 To use a different model:
 ```bash
 export MODEL_PATH=~/.cache/huggingface/hub/models--HauhauCS--Qwen3.5-9B-Uncensored-HauhauCS-Aggressive/snapshots/335e9ef38ada3edf9f9a3a6c2836022c1ab76ea1/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf
-CONTEXT_LENGTH=65536 PARALLEL_SLOTS=4 bash inference/entrypoint-metal.sh
+CONTEXT_LENGTH=131072 PARALLEL_SLOTS=4 bash inference/entrypoint-metal.sh
 ```
 
 Key flags (same as CUDA, different backend):
@@ -122,8 +123,10 @@ Key flags (same as CUDA, different backend):
 | Flag | Purpose |
 |------|---------|
 | `-ngl 99` | offload all 35 layers to Metal GPU |
-| `--flash-attn on` | fused attention kernels (Metal ≥ b3900) |
-| `-ctk q8_0 -ctv q4_0` | KV cache quantisation — saves unified memory |
+| `--flash-attn on` | fused attention kernels — Metal requires K and V of the same type |
+| `-ctk f16 -ctv f16` | full-precision KV cache (default); use `q8_0`/`q8_0` on 16 GB Macs — never mixed types |
+| prompt cache on | reuses the encoded prefix between turns (no `--no-cache-prompt`) |
+| `--host 127.0.0.1` | loopback only (`ATLAS_LLAMA_HOST` to override) — llama-server has no auth here |
 | `--embeddings` | expose `/v1/embeddings` for Geometric Lens |
 | `--jinja` | Qwen3.5 chat template via jinja2 |
 | `--mlock` | pin model in RAM (no swap) |
@@ -139,7 +142,11 @@ Memory budget on common Mac configs:
 | M2 / M3 (8 GB) | 8 GB | No — model alone is 7.5 GB |
 | M2 / M3 (16 GB) | 16 GB | Yes — ~6 GB headroom for KV + OS |
 | M2 Max / M3 Max (32 GB) | 32 GB | Comfortable, raise `PARALLEL_SLOTS=4` |
-| M1 Ultra / M2 Ultra (64 GB+) | 64 GB | Raise `CONTEXT_LENGTH=65536`, `PARALLEL_SLOTS=4` |
+| M1 Ultra / M2 Ultra (64 GB+) | 64–128 GB | `CONTEXT_LENGTH=131072`, `PARALLEL_SLOTS=4`, f16 KV (run-mac.sh defaults) |
+
+`-c` is the **total** context, split evenly across slots, so keep
+`CONTEXT_LENGTH / PARALLEL_SLOTS` ≥ `max_input_tokens` in
+`.aider.model.metadata.json` (32768).
 
 ---
 
@@ -163,7 +170,7 @@ LLAMA_EMBED_URL=http://localhost:8080 \
 GEOMETRIC_LENS_ENABLED=true \
 PROJECT_DATA_DIR=/tmp/atlas-projects \
 REDIS_URL=redis://localhost:6379 \
-  python -m uvicorn main:app --host 0.0.0.0 --port 8099
+  python -m uvicorn main:app --host 127.0.0.1 --port 8099
 
 python3 -c "
 from huggingface_hub import hf_hub_download
@@ -237,8 +244,10 @@ curl -s http://localhost:8090/health
 | Variable | Default | Notes |
 |----------|---------|-------|
 | `MODEL_PATH` | *(auto from HF cache)* | override to use a different model file |
-| `CONTEXT_LENGTH` | `32768` | raise to `65536` on ≥32 GB |
-| `PARALLEL_SLOTS` | `1` | raise to `4` on M1/M2 Ultra (64 GB) |
-| `KV_CACHE_TYPE_K` | `q8_0` | |
-| `KV_CACHE_TYPE_V` | `q4_0` | |
+| `CONTEXT_LENGTH` | `32768` | total across slots; `run-mac.sh` uses `131072` |
+| `PARALLEL_SLOTS` | `1` | `run-mac.sh` uses `4` (32 K per slot) |
+| `KV_CACHE_TYPE_K` | `f16` | must equal `KV_CACHE_TYPE_V` (Metal flash attention) |
+| `KV_CACHE_TYPE_V` | `f16` | `q8_0` for both on 16 GB Macs |
+| `ATLAS_LLAMA_HOST` | `127.0.0.1` | loopback only; no auth on llama-server |
+| `ATLAS_LLAMA_PORT` | `8080` | |
 | `LLAMA_SERVER` | auto-detected | override if binary is elsewhere |

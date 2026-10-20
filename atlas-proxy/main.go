@@ -2414,14 +2414,13 @@ func handleStreamingChat(w http.ResponseWriter, r *http.Request, req ChatRequest
 
 	if contentSentDuringStream == 0 {
 		if strings.TrimSpace(content) != "" {
-			// Think-only stream: the model generated everything inside <think>…</think>
-			// and nothing after </think>. stripThinkBlock already extracted the usable
-			// content (code / answer) from inside the think block. Inject it now.
-			log.Printf("  think-only stream — injecting extracted content (%d chars)", len(content))
+			// The answer arrived in the same chunk as </think>, so the think-block
+			// filter suppressed it. Inject the text after </think> now.
+			log.Printf("  answer was suppressed with </think> — injecting it (%d chars)", len(content))
 			injectContentDelta(w, flusher, content)
 		} else {
-			// Truly empty stream — model produced nothing at all. Retry non-streamed
-			// with a higher temperature to break out of the think loop.
+			// Empty or think-only stream — no answer after </think>. Retry
+			// non-streamed (forwardToFox disables thinking) at a higher temperature.
 			log.Printf("  empty stream response — retrying non-streamed")
 			retryReq := req
 			retryReq.Stream = false
@@ -3176,7 +3175,8 @@ func inferFilenameFromContent(content string, userMsg string) string {
 
 // stripThinkBlock removes a leading <think>...</think> block from model output.
 // If the model ignored /nothink and generated a think block, the actual answer
-// is everything after </think>. Falls back to the think content if nothing follows.
+// is everything after </think>. A think-only or unterminated block yields "":
+// the reasoning is never the answer, and callers treat empty as "retry".
 func stripThinkBlock(s string) string {
 	trimmed := strings.TrimSpace(s)
 	if !strings.HasPrefix(trimmed, "<think>") {
@@ -3184,17 +3184,10 @@ func stripThinkBlock(s string) string {
 	}
 	end := strings.Index(trimmed, "</think>")
 	if end == -1 {
-		// Unterminated think block — strip the <think> prefix and return the rest
-		after := strings.TrimPrefix(trimmed, "<think>")
-		return strings.TrimSpace(after)
+		// Unterminated think block (hit max_tokens mid-reasoning)
+		return ""
 	}
-	after := strings.TrimSpace(trimmed[end+len("</think>"):])
-	if after == "" {
-		// Nothing after </think> — fall back to think content as the answer
-		think := trimmed[len("<think>"):end]
-		return strings.TrimSpace(think)
-	}
-	return after
+	return strings.TrimSpace(trimmed[end+len("</think>"):])
 }
 
 func min(a, b int) int {

@@ -175,3 +175,6 @@ highscores.json
 geometric-lens/geometric_lens/gate_analysis.py
 geometric-lens/geometric_lens/gate_embeddings.json
 geometric-lens/geometric_lens/gate_report.json
+
+# Built atlas-proxy binary (setup-mac.sh builds to ~/.local/bin)
+atlas-proxy/atlas-proxy

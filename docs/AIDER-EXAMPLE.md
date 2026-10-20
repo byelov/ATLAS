@@ -58,7 +58,7 @@ Two files tell Aider how to talk to the ATLAS proxy. They live at the **project 
   cache_control: false
   caches_by_default: false
   streaming: true
-  reminder: sys
+  reminder: user
 ```
 
 ### `.aider.model.metadata.json`

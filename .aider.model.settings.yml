@@ -10,4 +10,4 @@
   cache_control: false
   caches_by_default: false
   streaming: true
-  reminder: sys
+  reminder: user

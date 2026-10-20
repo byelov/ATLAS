@@ -33,11 +33,26 @@ MODEL_FILE="${MODEL_PATH}"
 
 # ── Context / KV cache ──────────────────────────────────────────────────────
 # Mac unified memory: GPU and CPU share the same pool.
-# Q6_K  ≈ 7.5 GB model weight + ~1.5 GB KV at 32 K ctx → fits in 16 GB M2.
-# Raise to 65536 on M2 Max/Ultra (32–64 GB).
+# Q6_K  ≈ 7.5 GB model weight; the KV cache comes on top of that.
+# -c is the TOTAL context, split evenly across --parallel slots.
+# run-mac.sh raises this to 131072 / 4 slots (32 K per slot) on M1 Ultra.
 CTX_LENGTH="${CONTEXT_LENGTH:-32768}"
-KV_CACHE_K="${KV_CACHE_TYPE_K:-q8_0}"   # key cache quantization
-KV_CACHE_V="${KV_CACHE_TYPE_V:-q4_0}"   # value cache quantization
+# K and V must be the SAME type: the Metal flash-attention kernel rejects
+# mixed K/V types (ggml-metal-device.m), which pushes attention onto the CPU.
+# f16/f16 is the fastest and needs the most memory; on a 16 GB Mac use
+# KV_CACHE_TYPE_K=q8_0 KV_CACHE_TYPE_V=q8_0 instead.
+KV_CACHE_K="${KV_CACHE_TYPE_K:-f16}"
+KV_CACHE_V="${KV_CACHE_TYPE_V:-f16}"
+if [[ "$KV_CACHE_K" != "$KV_CACHE_V" ]]; then
+  echo "WARNING: KV_CACHE_TYPE_K=$KV_CACHE_K != KV_CACHE_TYPE_V=$KV_CACHE_V —"
+  echo "         Metal flash attention needs matching types; attention will run on the CPU."
+fi
+
+# ── Network ─────────────────────────────────────────────────────────────────
+# Loopback only by default: llama-server has no auth here. Set
+# ATLAS_LLAMA_HOST=0.0.0.0 only if another machine must reach it.
+HOST="${ATLAS_LLAMA_HOST:-127.0.0.1}"
+PORT="${ATLAS_LLAMA_PORT:-8080}"
 
 # ── Parallelism ─────────────────────────────────────────────────────────────
 # 1–2 slots is comfortable for dev on a 16 GB machine.
@@ -59,7 +74,8 @@ echo "  Binary : $LLAMA_SERVER"
 echo "  Model  : $MODEL_FILE"
 echo "  Context: $CTX_LENGTH tokens"
 echo "  KV     : K=$KV_CACHE_K  V=$KV_CACHE_V"
-echo "  Slots  : $PARALLEL"
+echo "  Slots  : $PARALLEL ($((CTX_LENGTH / PARALLEL)) tokens per slot)"
+echo "  Listen : $HOST:$PORT"
 echo "  Backend: Metal (GPU layers = 99, unified memory)"
 echo "  Grammar: JSON-schema constrained decoding via atlas-proxy"
 echo ""
@@ -71,11 +87,19 @@ echo ""
 # REMOVED: -DCMAKE_CUDA_ARCHITECTURES, nvidia device mounts
 #
 # KEPT:  -ngl 99           → offload all layers to Metal GPU
-# KEPT:  --flash-attn on   → works on Metal (llama.cpp ≥ b3900)
-# KEPT:  -ctk/-ctv         → KV cache quant is backend-agnostic
+# KEPT:  --flash-attn on   → works on Metal when K and V types match
+# KEPT:  -ctk/-ctv         → see the matching-type note above
 # KEPT:  --embeddings       → Qwen3.5 self-embeddings (4096-dim) for Lens C(x)
 # KEPT:  --jinja            → prompt template rendering
 # KEPT:  --cont-batching    → continuous batching for multi-slot
+#
+# Prompt cache: left ON (no --no-cache-prompt). Aider resends the repo map
+# and chat files every turn; re-encoding them is the slowest step on Apple
+# Silicon. Context checkpoints stay at llama.cpp's default so the hybrid
+# DeltaNet model can roll back to a recent prefix instead of starting over.
+#
+# --fit off: fail fast at startup if model + KV do not fit, instead of
+#   llama.cpp silently shrinking the context.
 #
 # --mlock: keeps the model in physical RAM (no swap).
 #   On macOS this requires the process to have the right limits.
@@ -89,13 +113,13 @@ exec "$LLAMA_SERVER" \
   --parallel  "$PARALLEL" \
   --cont-batching \
   -ngl 99 \
-  --host 0.0.0.0 \
-  --port 8080 \
+  --host "$HOST" \
+  --port "$PORT" \
   --flash-attn on \
+  --fit off \
   --mlock \
   -b 4096 \
   -ub 4096 \
-  --no-cache-prompt \
   --embeddings \
   --jinja \
   --reasoning-format none \

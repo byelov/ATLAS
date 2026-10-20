@@ -116,12 +116,13 @@ echo 'export MODEL_PATH=$(python3 -c "from huggingface_hub import hf_hub_downloa
 bash scripts/build-llama-metal.sh
 ```
 
-This clones llama.cpp to `~/llama.cpp`, applies the ATLAS spec-decode patch,
-and builds with `-DGGML_METAL=ON`. Takes 3–5 minutes on M1.
+This clones llama.cpp to `~/llama.cpp`, checks out the pinned revision
+(`LLAMA_CPP_REV`, the one inferstep/ATLAS v3.1.6 validates), applies the ATLAS
+spec-decode patch, and builds with `-DGGML_METAL=ON`. Takes 3–5 minutes on M1.
 
-Symlink the binary so it is on your PATH:
+Symlink the binary so it is on your PATH (no sudo needed):
 ```bash
-sudo ln -sf ~/llama.cpp/build/bin/llama-server /usr/local/bin/llama-server
+mkdir -p ~/.local/bin && ln -sf ~/llama.cpp/build/bin/llama-server ~/.local/bin/llama-server
 ```
 
 Verify:
@@ -204,20 +205,18 @@ Open **five terminal tabs** (or use `tmux`), one per service.
 
 ```bash
 # MODEL_PATH must be set (see Step 2); no conda env needed for the C++ binary
-CONTEXT_LENGTH=65536 \
+CONTEXT_LENGTH=131072 \
 PARALLEL_SLOTS=4 \
   bash inference/entrypoint-metal.sh
 ```
 
-M1 64 GB budget at these settings:
-- Model Q6_K: ~7.5 GB
-- KV cache (4 slots × 65 K ctx, q8_0/q4_0): ~8 GB
-- OS + other services: ~4 GB
-- **Total: ~20 GB / 64 GB** — very comfortable
+`-c` is the total context, split evenly across slots: 131072 / 4 = 32 K per
+slot, which matches Aider's `max_input_tokens`. The KV cache is f16 for both K
+and V — Metal flash attention needs matching types.
 
 Wait for the line:
 ```
-llama server listening at http://0.0.0.0:8080
+llama server listening at http://127.0.0.1:8080
 ```
 
 ### Terminal 2 — Geometric Lens
@@ -230,7 +229,7 @@ LLAMA_EMBED_URL=http://localhost:8080 \
 GEOMETRIC_LENS_ENABLED=true \
 PROJECT_DATA_DIR=/tmp/atlas-projects \
 REDIS_URL=redis://localhost:6379 \
-  python -m uvicorn main:app --host 0.0.0.0 --port 8099
+  python -m uvicorn main:app --host 127.0.0.1 --port 8099
 ```
 
 ### Terminal 3 — V3 Pipeline Service
@@ -242,6 +241,7 @@ ATLAS_INFERENCE_URL=http://localhost:8080 \
 ATLAS_LENS_URL=http://localhost:8099 \
 ATLAS_SANDBOX_URL=http://localhost:8020 \
 ATLAS_MODEL_NAME=Qwen3.5-9B-Q6_K \
+ATLAS_V3_HOST=127.0.0.1 \
   python main.py
 ```
 
@@ -250,7 +250,7 @@ ATLAS_MODEL_NAME=Qwen3.5-9B-Q6_K \
 ```bash
 conda activate atlas
 cd sandbox
-python executor_server.py
+SANDBOX_HOST=127.0.0.1 python executor_server.py
 ```
 
 Runs on port **8020** in bare-metal mode (no Docker port remapping).
@@ -317,17 +317,17 @@ atlas
 
 ---
 
-## Tuning for M1 64 GB
+## Tuning for M1 Ultra (64–128 GB)
 
-| Variable | Default | M1 64 GB recommendation |
+| Variable | Default | M1 Ultra recommendation |
 |----------|---------|--------------------------|
-| `CONTEXT_LENGTH` | 32768 | **65536** — 64 K context per slot |
+| `CONTEXT_LENGTH` | 32768 | **131072** total — 32 K per slot with 4 slots |
 | `PARALLEL_SLOTS` | 1 | **4** — 4 concurrent request slots |
-| `KV_CACHE_TYPE_K` | `q8_0` | keep `q8_0` |
-| `KV_CACHE_TYPE_V` | `q4_0` | keep `q4_0` |
+| `KV_CACHE_TYPE_K` | `f16` | keep `f16` |
+| `KV_CACHE_TYPE_V` | `f16` | keep `f16` — never mix K/V types on Metal |
 
-With 4 slots × 65 K context the total KV footprint is ~8 GB.
-You have ~40 GB of headroom for OS, other apps, and future larger models.
+Per-slot context is `CONTEXT_LENGTH / PARALLEL_SLOTS`; keep it at or above
+Aider's `max_input_tokens`. Check `n_ctx_slot` in the llama-server log.
 
 ---
 

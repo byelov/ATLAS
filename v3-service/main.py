@@ -57,6 +57,7 @@ INFERENCE_URL = os.environ.get("ATLAS_INFERENCE_URL", "http://localhost:8080")
 LENS_URL = os.environ.get("ATLAS_LENS_URL", "http://localhost:8099")
 SANDBOX_URL = os.environ.get("ATLAS_SANDBOX_URL", "http://localhost:30820")
 PORT = int(os.environ.get("ATLAS_V3_PORT", "8070"))
+HOST = os.environ.get("ATLAS_V3_HOST", "0.0.0.0")
 
 BASE_TEMPERATURE = 0.6
 DIVERSITY_TEMPERATURE = 0.8
@@ -1006,7 +1007,7 @@ if __name__ == "__main__":
     print(f"  Geometric Lens: {LENS_URL}")
     print(f"  Sandbox: {SANDBOX_URL}")
 
-    server = HTTPServer(("0.0.0.0", PORT), V3Handler)
+    server = HTTPServer((HOST, PORT), V3Handler)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
