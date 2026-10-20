@@ -1698,4 +1698,7 @@ if __name__ == "__main__":
     import uvicorn
     WORKSPACE_BASE.mkdir(parents=True, exist_ok=True)
     logger.info(f"Supported languages: {list(LANGUAGE_HANDLERS.keys())}")
-    uvicorn.run(app, host="0.0.0.0", port=8020)
+    # The container listens on 0.0.0.0:8020 (compose publishes it on
+    # 127.0.0.1). The native macOS path binds 127.0.0.1 on the host port.
+    uvicorn.run(app, host=os.getenv("ATLAS_SANDBOX_HOST", "0.0.0.0"),
+                port=int(os.getenv("ATLAS_SANDBOX_PORT", "8020")))

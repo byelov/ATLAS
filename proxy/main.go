@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -42,6 +43,9 @@ var (
 	sandboxURL   = envOr("ATLAS_SANDBOX_URL", "http://localhost:30820")
 	v3URL        = envOr("ATLAS_V3_URL", "http://localhost:8070")
 	proxyPort    = envOr("ATLAS_PROXY_PORT", "8090")
+	// Empty = every interface (the container default; compose publishes
+	// the port on 127.0.0.1 only). The native macOS path sets 127.0.0.1.
+	proxyHost    = envOr("ATLAS_PROXY_HOST", "")
 	modelName    = envOr("ATLAS_MODEL_NAME", "local-model")
 	healthClient = &http.Client{Timeout: 3 * time.Second}
 	// v3-service can take longer to answer when a pipeline run is in
@@ -350,7 +354,7 @@ func main() {
 	}
 	log.SetOutput(filteringWriter{w: out})
 
-	addr := ":" + proxyPort
+	addr := net.JoinHostPort(proxyHost, proxyPort)
 	log.Printf("ATLAS Proxy v3.1.6 starting on %s", addr)
 	log.Printf("  Inference: %s", inferenceURL)
 	log.Printf("  Geometric Lens: %s", lensURL)

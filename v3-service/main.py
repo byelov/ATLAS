@@ -55,6 +55,9 @@ __all__ = [
 ]
 
 PORT = int(os.environ.get("ATLAS_V3_PORT", "8070"))
+# 0.0.0.0 in the container (compose publishes on 127.0.0.1); the native
+# macOS path binds 127.0.0.1.
+HOST = os.environ.get("ATLAS_V3_HOST", "0.0.0.0")
 
 
 # --- HTTP Handler (SSE streaming) --------------------------------------------
@@ -716,7 +719,7 @@ if __name__ == "__main__":
     # pipeline._SUMMARY_LOCK), per-run state (events, candidates, adapters)
     # is local to each request, and the graph package's FileGraphCache
     # carries its own lock.
-    server = ThreadingHTTPServer(("0.0.0.0", PORT), V3Handler)
+    server = ThreadingHTTPServer((HOST, PORT), V3Handler)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
