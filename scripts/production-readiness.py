@@ -258,7 +258,9 @@ def _gates(pytest_paths: Sequence[str]) -> dict[str, Gate]:
             (
                 "shellcheck",
                 "--severity=error",
-                *sorted(str(p.relative_to(ROOT)) for p in (ROOT / "scripts").glob("*.sh")),
+                *sorted(str(p.relative_to(ROOT)) for p in (
+                    *(ROOT / "scripts").glob("*.sh"),
+                    *(ROOT / "scripts" / "native").glob("*.sh"))),
             ),
             required=False,
             available=lambda: _command_available("shellcheck"),

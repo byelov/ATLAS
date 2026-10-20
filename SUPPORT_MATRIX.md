@@ -136,6 +136,7 @@ locally-built bundle.
 |---|---|---|
 | Docker Compose (base + backend overlay) | Supported | CI compose validation on every overlay; releases smoke-tested; the deterministic E2E drives the control plane |
 | macOS hybrid (native llama + compose) | Supported | Maintainer-verified (M2 Pro) |
+| macOS native (launchd agents + Seatbelt sandbox, no Docker) | Preview | On an M1 Ultra 128 GB: the sandbox executor run under the generated Seatbelt profile passes an allow/deny probe suite (project-only writes, home unreadable, ATLAS ports blocked, launchctl/open denied, C/Go/Rust/Python toolchains work), launchd load/restart/stop/uninstall exercised; unit tests for plists, profile and wrapper. Full stack with a loaded model not yet hardware-validated. [SETUP_MACOS_NATIVE.md](docs/SETUP_MACOS_NATIVE.md) |
 | K3s (generated manifests) | Preview | Templates validated + rendered in CI; no automated live-cluster test |
 | Bare metal | Preview | Documented (SETUP.md Method 2); manual validation only |
 | Offline / air-gapped | Unsupported | Model + artifact downloads require network; no offline bundle exists |

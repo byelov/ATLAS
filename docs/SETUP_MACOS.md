@@ -294,6 +294,6 @@ Inference will be slower but you don't need brew, cmake, or the setup script.
 - [ ] Hardware validation on M3 Max 36+ GB
 - [ ] Hardware validation on M4 series
 - [ ] Pre-built `llama-server-metal` binaries on GHCR releases (skip the build step)
-- [ ] Pure-native path (drop Docker entirely on Mac, use launchd) — separate ticket if there's demand
+- [x] Pure-native path (drop Docker entirely on Mac, use launchd) — see [SETUP_MACOS_NATIVE.md](SETUP_MACOS_NATIVE.md)
 
 Report issues on [#32](https://github.com/inferstep/ATLAS/issues/32) with your Mac model + memory size + `atlas doctor` output.

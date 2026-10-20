@@ -157,6 +157,23 @@ def resolve_backend(
     return backend.strip().lower() if backend else None
 
 
+def resolve_deploy(
+    atlas_root: str,
+    values: Optional[Mapping[str, str]] = None,
+    environ: Optional[Mapping[str, str]] = None,
+) -> str:
+    """Deployment mode: ``native`` (macOS launchd agents, no Docker — see
+    atlas/commands/native.py) or ``docker`` (the default; every compose
+    path, including the macOS hybrid). Shell environment wins over .env."""
+    env = os.environ if environ is None else environ
+    deploy = env.get("ATLAS_DEPLOY")
+    if not deploy and values is not None:
+        deploy = values.get("ATLAS_DEPLOY")
+    if not deploy and values is None:
+        deploy = read_env_file(atlas_root).get("ATLAS_DEPLOY")
+    return "native" if (deploy or "").strip().lower() == "native" else "docker"
+
+
 def file_args(
     atlas_root: str,
     backend: Optional[str] = None,

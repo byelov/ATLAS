@@ -117,6 +117,14 @@ SCHEMA: Dict[str, Field] = {
     "ATLAS_SECRETS_DIR": Field("str"),
     "ATLAS_MACOS_PREFIX": Field("str"),
     "ATLAS_LLAMA_HOST": Field("str"),
+    # Native macOS deployment (atlas native).
+    "ATLAS_DEPLOY": Field("enum", enum=("docker", "native")),
+    "ATLAS_NATIVE_HOME": Field("str"),
+    "ATLAS_LAUNCHD_PREFIX": Field("str"),
+    "ATLAS_NATIVE_DEP_TIMEOUT": Field("int", min=1, max=86_400),
+    "ATLAS_PROXY_HOST": Field("str"),
+    "ATLAS_V3_HOST": Field("str"),
+    "ATLAS_SANDBOX_HOST": Field("str"),
     # Written by `atlas init` (wizard-detected GPU vendor + host UID/GID
     # for the proxy container); validate() must not flag its own output.
     "ATLAS_GPU_VENDOR": Field("str"),

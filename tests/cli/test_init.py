@@ -700,3 +700,45 @@ def test_loose_secrets_perms_without_yes_fails_noninteractive(tmp_path,
     assert "Setup incomplete" in out
     assert "Setup complete" not in out
     assert not os.path.exists(os.path.join(secrets_dir, "api-keys.json"))
+
+
+def test_deploy_native_writes_native_env(tmp_path, monkeypatch, capsys):
+    """--deploy native implies metal, skips the hybrid prompt, writes
+    ATLAS_DEPLOY=native and points the operator at the native bring-up."""
+    monkeypatch.setattr(tier, "probe", lambda install_dir=None: _apple_probe(128.0))
+    monkeypatch.setattr(init, "_host_is_macos", lambda: True)
+
+    root = _make_atlas_root(tmp_path)
+    rc = _run(monkeypatch, root,
+              ["--yes", "--skip-download", "--no-color", "--deploy", "native"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "Apple Silicon detected" not in out
+    assert "atlas native install" in out
+    body = pathlib.Path(root, ".env").read_text()
+    assert "ATLAS_BACKEND=metal" in body
+    assert "ATLAS_DEPLOY=native" in body
+    assert "SETUP_MACOS_NATIVE.md" in body
+    assert "docker-compose.macos.yml" not in body
+
+
+def test_deploy_native_refused_off_macos(tmp_path, monkeypatch):
+    monkeypatch.setattr(init, "_host_is_macos", lambda: False)
+    root = _make_atlas_root(tmp_path)
+    assert _run(monkeypatch, root,
+                ["--yes", "--skip-download", "--deploy", "native"]) == 2
+    assert not os.path.isfile(os.path.join(root, ".env"))
+
+
+def test_metal_env_never_mixes_kv_types(tmp_path, monkeypatch):
+    """Metal flash attention rejects K != V; a tier preset with q8_0/q4_0
+    must land in .env with matching types."""
+    monkeypatch.setattr(tier, "probe", lambda install_dir=None: _apple_probe(18.0))
+    root = _make_atlas_root(tmp_path)
+    assert _run(monkeypatch, root,
+                ["--yes", "--skip-download", "--no-color",
+                 "--backend", "metal"]) == 0
+    values = dict(line.split("=", 1) for line in
+                  pathlib.Path(root, ".env").read_text().splitlines()
+                  if "=" in line and not line.startswith("#"))
+    assert values["ATLAS_KV_TYPE_K"] == values["ATLAS_KV_TYPE_V"]

@@ -85,7 +85,24 @@ def _service_health(atlas_root: str) -> Dict[str, object]:
     return out
 
 
+def _native_logs(lines: int) -> Dict[str, str]:
+    """ATLAS_DEPLOY=native: the launchd agents log to files, not compose."""
+    from atlas.commands import native
+    out: Dict[str, str] = {}
+    for svc in native.SERVICES:
+        path = native.log_path(svc)
+        try:
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                raw = "".join(fh.readlines()[-lines:])
+        except OSError as e:
+            raw = f"(no log at {path}: {type(e).__name__})"
+        out[svc] = redact.filter_private_values(raw)
+    return out
+
+
 def _recent_logs(atlas_root: str, lines: int) -> Dict[str, str]:
+    if compose_config.resolve_deploy(atlas_root) == "native":
+        return _native_logs(lines)
     out: Dict[str, str] = {}
     for svc in ("atlas-proxy", "v3-service", "geometric-lens", "sandbox"):
         cmd = compose_config.command(
@@ -124,8 +141,10 @@ def _collect(atlas_root: str, log_lines: int) -> dict:
         },
         "config": _filtered_env(atlas_root),
         "services": _service_health(atlas_root),
-        "images": _run(compose_config.command(
-            atlas_root, ["images"]), cwd=atlas_root),
+        "images": ("(native deployment — no images)"
+                   if compose_config.resolve_deploy(atlas_root) == "native"
+                   else _run(compose_config.command(
+                       atlas_root, ["images"]), cwd=atlas_root)),
         "recent_logs": _recent_logs(atlas_root, log_lines),
         "doctor": _doctor_json(atlas_root),
     }

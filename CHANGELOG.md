@@ -4,6 +4,23 @@
 
 ## [Unreleased]
 
+### macOS: a fully native deployment (no Docker)
+- `atlas native install|uninstall|start|stop|restart|status|logs|project` runs every service as a per-user launchd agent. Each agent runs `scripts/native/atlas-service.sh <service>`, which mirrors that service's compose entry (environment, `depends_on`) and listens on `127.0.0.1` at the port compose publishes, so `atlas`, the TUI and `atlas doctor` work unchanged. Request-path agents run with `ProcessType=Interactive` (no launchd throttling); the sandbox runs `Standard` at nice 5.
+- The sandbox runs under a Seatbelt profile regenerated on every start (`atlas native render-profile`). Only the project is writable. The home directory, `secrets/` and `.env` are unreadable (the executor's service token excepted). The other ATLAS services are unreachable from executed code, signals stay inside the sandbox, `launchctl`/`open`/`osascript`/AppleEvents are denied, git hooks can't be planted, and `ATLAS_SANDBOX_NET_INTERNAL=true` cuts all egress. There are no memory/CPU/PID caps; executor timeouts bound each command.
+- `./scripts/atlas-setup-macos.sh --native` builds the proxy and one venv per service from the images' pinned requirements (Python 3.12 for lens/v3, 3.13 for the sandbox plus a writable tools venv for executed code).
+- `atlas init --deploy native` writes `ATLAS_DEPLOY=native`. `atlas doctor` checks the agents, runtime and Seatbelt profile instead of Docker, `atlas diagnostics` bundles the launchd logs, and `atlas` starts the launchd proxy and re-points the sandbox at the launch directory instead of recreating containers.
+- New bind-address settings, defaulting to the old behaviour: `ATLAS_PROXY_HOST`, `ATLAS_V3_HOST`, `ATLAS_SANDBOX_HOST`, plus `ATLAS_SANDBOX_PORT` for the executor's own listen port.
+- Docs: [SETUP_MACOS_NATIVE.md](docs/SETUP_MACOS_NATIVE.md).
+
+### Apple Silicon sizing and speed
+- `atlas tier fit` budgets the Metal working-set limit (≈2/3 of RAM up to 36 GiB, ≈3/4 above, `iogpu.wired_limit_mb` if set, minus an 8 GiB host reserve) instead of all of unified memory. New `--per-slot-cap` raises the 32K per-slot ceiling, e.g. `--slots 6 --per-slot-cap 65536` on a 128 GB M1 Ultra.
+- The Mac launcher and `atlas init` no longer pick mixed K/V cache types (`q8_0`/`q4_0`): Metal's flash-attention kernel rejects mixed types, which moved attention to the CPU. The launcher warns when they're set explicitly.
+- `scripts/atlas-llama-macos.sh` passes `--pooling` (`ATLAS_EMBED_POOLING`, default `mean`) like the Docker entrypoint; the lens's embedding contract depends on it.
+- The TUI launcher passes `ATLAS_CTX_SIZE`/`ATLAS_PARALLEL_SLOTS` from `.env` to the TUI, which otherwise budgeted every turn as 32768/1 regardless of sizing.
+
+### Tests
+- TUI session tests redirect `HOME` too: on macOS `os.UserCacheDir` ignores `XDG_CACHE_HOME`, so they wrote into the real `~/Library/Caches/atlas-tui/sessions` and failed.
+
 ## [3.1.6] - 2026-10-01 — Maia
 
 A security release. It changes nothing else.

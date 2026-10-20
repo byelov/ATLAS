@@ -5,6 +5,7 @@ ensure_proxy() strategy:
    proxy's /workspace bind to the caller's CWD — PC-038/PC-189)
 2. A docker-compose stack owns atlas-proxy (#118) → wait for it or tell
    the user to bring the stack up; never launch a competing local proxy
+   (ATLAS_DEPLOY=native: launchd owns it — start the agent and wait)
 3. Go available + no docker stack → build (if needed) and launch locally
 4. Nothing available → False
 
@@ -465,6 +466,12 @@ def _repair_proxy_capability(atlas_dir: str, capability: str) -> bool:
     """Replace a reachable but stale proxy with one from this checkout."""
     if _proxy_supports_capability(capability):
         return True
+    if _native_deploy(atlas_dir):
+        print("  The launchd atlas-proxy is older than this checkout. Rebuild "
+              "and restart it:\n"
+              "    ./scripts/atlas-setup-macos.sh --native && "
+              "atlas native restart atlas-proxy")
+        return False
     if _docker_compose_owns_proxy(atlas_dir):
         return _rebuild_docker_proxy_for_capability(atlas_dir, os.getcwd(), capability)
     if not _find_go():
@@ -479,9 +486,36 @@ def _repair_proxy_capability(atlas_dir: str, capability: str) -> bool:
     return _proxy_supports_capability(capability)
 
 
+def _native_deploy(atlas_dir: str) -> bool:
+    """ATLAS_DEPLOY=native: every service is a launchd agent (no Docker)."""
+    return compose_config.resolve_deploy(atlas_dir) == "native"
+
+
+def _align_native_workspace(atlas_dir: str, cwd: str) -> None:
+    """Native counterpart of the Docker recreate below. The launchd proxy
+    already serves each request's working_dir, but the sandbox's workspace
+    root must EQUAL it (V3 build verification snapshots that root and
+    writes candidates relative to it), so re-point and restart the
+    sandbox when `atlas` is launched from a different directory."""
+    current = (os.environ.get("ATLAS_PROJECT_DIR")
+               or compose_config.read_env_file(atlas_dir).get(
+                   "ATLAS_PROJECT_DIR", ""))
+    if current:
+        if not os.path.isabs(current):
+            current = os.path.join(atlas_dir, current)
+        if os.path.realpath(os.path.expanduser(current)) == cwd:
+            return
+    print(f"  Pointing the native sandbox at {cwd}...")
+    from atlas.commands import native
+    if native.set_project(cwd) != 0:
+        print("  Continuing with the existing workspace — commands may not "
+              "see your project.")
+
+
 def _align_workspace(atlas_dir: str) -> None:
     """If the proxy is running in Docker and its /workspace bind doesn't
     cover the current working directory, recreate it so it does. See PC-038.
+    Native deployments re-point the sandbox instead (_align_native_workspace).
 
     Disable with ATLAS_AUTO_WORKSPACE=0 — the user keeps whatever bind the
     proxy was started with.
@@ -489,6 +523,9 @@ def _align_workspace(atlas_dir: str) -> None:
     if os.environ.get("ATLAS_AUTO_WORKSPACE", "1") == "0":
         return
     cwd = os.path.realpath(os.getcwd())
+    if _native_deploy(atlas_dir):
+        _align_native_workspace(atlas_dir, cwd)
+        return
     proxy_bound = _docker_proxy_workspace()
     if proxy_bound is None:
         # Local proxy (not in Docker) — _launch_local_proxy already pinned
@@ -581,6 +618,26 @@ def ensure_proxy(required_capability: Optional[str] = None) -> bool:
             return False
         _align_workspace(atlas_dir)
         return True
+
+    # Native macOS: launchd owns atlas-proxy. Start the agent (a no-op
+    # kick if it is loaded) and wait — it comes up after llama-server,
+    # lens, v3 and the sandbox are healthy, which includes the model load.
+    if _native_deploy(atlas_dir):
+        from atlas.commands import native
+        print("  launchd owns atlas-proxy (ATLAS_DEPLOY=native). Starting the "
+              "native stack...")
+        native.main(["start"])
+        if _wait_for_proxy(timeout=180):
+            print(f"  Proxy responded on port {PROXY_PORT}")
+            if required_capability and not _repair_proxy_capability(
+                atlas_dir, required_capability
+            ):
+                return False
+            _align_workspace(atlas_dir)
+            return True
+        print("  Proxy never responded. Check:  atlas native status")
+        print("  and the logs in ~/Library/Logs/atlas/.")
+        return False
 
     # #118: macOS hybrid + Linux + CUDA/ROCm all run atlas-proxy in
     # docker. If the user's compose stack defines it, the stack owns

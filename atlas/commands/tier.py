@@ -1009,6 +1009,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         help="for `fit`: write the result into .env")
     parser.add_argument("--slots", type=int, default=None,
         help="for `fit`: parallel slot count (default: 4)")
+    parser.add_argument("--per-slot-cap", type=int, default=None,
+        help="for `fit`: largest context per slot in tokens (default: "
+             "32768); raise it on large unified-memory Macs")
     parser.add_argument("--json", action="store_true",
         help="emit JSON output (for PC-054 wizard, PC-056 model registry)")
     parser.add_argument("--raw", action="store_true",

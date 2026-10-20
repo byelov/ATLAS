@@ -4,6 +4,11 @@
 # install needs. Docker still runs the other 4 ATLAS services (proxy,
 # v3, lens, sandbox) via docker-compose.macos.yml.
 #
+# --native additionally prepares the fully native path (no Docker): the
+# proxy binary, a Python venv per service, and the sandbox's tools venv.
+# `atlas native install` then runs everything under launchd. See
+# docs/SETUP_MACOS_NATIVE.md.
+#
 # Why hybrid: Apple Silicon under MoltenVK in Docker Desktop is 5-10x
 # slower than native Metal. Running ONLY llama-server natively gets us
 # the inference perf without rewriting the entire service stack as
@@ -15,6 +20,7 @@
 #   ./scripts/atlas-setup-macos.sh                # default install
 #   ./scripts/atlas-setup-macos.sh --rebuild      # force rebuild llama-server
 #   ./scripts/atlas-setup-macos.sh --prefix DIR   # install root override
+#   ./scripts/atlas-setup-macos.sh --native       # + native services (no Docker)
 #
 # Idempotent — re-running is cheap, only rebuilds when --rebuild is
 # passed or when LLAMA_CPP_REV in the Dockerfiles has changed since
@@ -35,10 +41,12 @@ ATLAS_ROOT="$(dirname "$SCRIPT_DIR")"
 DEFAULT_PREFIX="$HOME/.atlas/macos"
 PREFIX="$DEFAULT_PREFIX"
 REBUILD=0
+NATIVE=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --rebuild) REBUILD=1; shift;;
+    --native) NATIVE=1; shift;;
     --prefix)
       [[ $# -ge 2 ]] || { echo "--prefix requires a value" >&2; exit 2; }
       PREFIX="$2"; shift 2;;
@@ -48,6 +56,9 @@ while [[ $# -gt 0 ]]; do
     *) echo "unknown flag: $1" >&2; exit 2;;
   esac
 done
+
+TOTAL=8
+if [[ $NATIVE -eq 1 ]]; then TOTAL=10; fi
 
 LLAMA_BUILD_DIR="$PREFIX/llama.cpp"
 LLAMA_BIN_DIR="$PREFIX/bin"
@@ -95,7 +106,7 @@ extract_llama_rev() {
 # Step 1 — sanity check: macOS + Apple Silicon
 # ---------------------------------------------------------------------------
 
-step "1/8" "Verifying macOS + Apple Silicon"
+step "1/$TOTAL" "Verifying macOS + Apple Silicon"
 
 if [[ "$(uname -s)" != "Darwin" ]]; then
   red "this script is for macOS only — got $(uname -s)."
@@ -119,7 +130,7 @@ green "  OK: $(uname -s) $(uname -m), $(sw_vers -productVersion)"
 # Apple's metal-cpp headers).
 # ---------------------------------------------------------------------------
 
-step "2/8" "Checking Xcode Command Line Tools"
+step "2/$TOTAL" "Checking Xcode Command Line Tools"
 
 if ! xcode-select -p >/dev/null 2>&1; then
   yellow "  Xcode CLT not installed. Triggering installer (a GUI dialog will appear)."
@@ -134,7 +145,7 @@ green "  OK: $(xcode-select -p)"
 # run a third-party install script unattended). Tell the user how.
 # ---------------------------------------------------------------------------
 
-step "3/8" "Checking Homebrew + dependencies"
+step "3/$TOTAL" "Checking Homebrew + dependencies"
 
 if ! command -v brew >/dev/null 2>&1; then
   red "Homebrew not installed. Install it manually before re-running:"
@@ -155,7 +166,12 @@ green "  OK: $(brew --version | head -1)"
 # atlas wrapper). uv is an optional but recommended replacement for
 # pip that's 10-100x faster.
 NEED=()
-for pkg in cmake git python@3.12 pipx go; do
+BREW_PKGS=(cmake git python@3.12 pipx go)
+# Native services: the sandbox runs Python 3.13 like its container (agent
+# code may use PEP 701 f-strings); bash 4+ for executed scripts (macOS
+# ships 3.2); libomp for the lens's xgboost.
+if [[ $NATIVE -eq 1 ]]; then BREW_PKGS+=(python@3.13 bash libomp); fi
+for pkg in "${BREW_PKGS[@]}"; do
   if ! brew list --formula "$pkg" >/dev/null 2>&1; then
     NEED+=("$pkg")
   fi
@@ -186,7 +202,7 @@ fi
 # Step 4 — Pin LLAMA_CPP_REV
 # ---------------------------------------------------------------------------
 
-step "4/8" "Reading LLAMA_CPP_REV from inference/Dockerfile.v31"
+step "4/$TOTAL" "Reading LLAMA_CPP_REV from inference/Dockerfile.v31"
 
 LLAMA_CPP_REV=$(extract_llama_rev)
 green "  Pinned SHA: $LLAMA_CPP_REV"
@@ -210,7 +226,7 @@ fi
 # ---------------------------------------------------------------------------
 
 if [[ $NEED_BUILD -eq 1 ]]; then
-  step "5/8" "Fetching llama.cpp at $LLAMA_CPP_REV + applying patches"
+  step "5/$TOTAL" "Fetching llama.cpp at $LLAMA_CPP_REV + applying patches"
 
   # Clean state — easiest way to guarantee a known-good build. Cheap
   # too: shallow fetch is ~30s.
@@ -252,7 +268,7 @@ if [[ $NEED_BUILD -eq 1 ]]; then
 
   popd >/dev/null
 
-  step "6/8" "Building llama.cpp with Metal (this is the slow step, ~5-10min)"
+  step "6/$TOTAL" "Building llama.cpp with Metal (this is the slow step, ~5-10min)"
 
   pushd "$LLAMA_BUILD_DIR" >/dev/null
     # Build flags:
@@ -333,7 +349,7 @@ fi
 # for atlas instead of mingling with other tools.
 # ---------------------------------------------------------------------------
 
-step "7/8" "Installing atlas CLI"
+step "7/$TOTAL" "Installing atlas CLI"
 
 # pipx install --force is idempotent — re-running upgrades in place.
 # --editable so 'git pull' picks up changes without reinstall.
@@ -372,7 +388,7 @@ fi
 # is already on PATH (pipx puts atlas there too).
 # ---------------------------------------------------------------------------
 
-step "8/8" "Building atlas-tui (Go Bubbletea client)"
+step "8/$TOTAL" "Building atlas-tui (Go Bubbletea client)"
 
 TUI_OUT="$HOME/.local/bin/atlas-tui"
 mkdir -p "$(dirname "$TUI_OUT")"
@@ -390,8 +406,107 @@ fi
 green "  Built and installed: $TUI_OUT"
 
 # ---------------------------------------------------------------------------
+# Steps 9-10 (--native) — the services Docker would otherwise run. Each
+# venv records a hash of the requirements it was built from and is only
+# rebuilt when they change, so re-runs stay cheap.
+# ---------------------------------------------------------------------------
+
+if [[ $NATIVE -eq 1 ]]; then
+  step "9/$TOTAL" "Building atlas-proxy (native)"
+  mkdir -p "$PREFIX/bin"
+  (cd "$ATLAS_ROOT/proxy" && go build -o "$PREFIX/bin/atlas-proxy.new" .)
+  mv -f "$PREFIX/bin/atlas-proxy.new" "$PREFIX/bin/atlas-proxy"
+  green "  Built and installed: $PREFIX/bin/atlas-proxy"
+
+  step "10/$TOTAL" "Creating service venvs"
+  PY312="$(brew --prefix python@3.12)/bin/python3.12"
+  PY313="$(brew --prefix python@3.13)/bin/python3.13"
+  NATIVE_HOME="${ATLAS_NATIVE_HOME:-$HOME/.atlas/native}"
+
+  # make_venv DIR PYTHON REQ_FILE... [-- EXTRA_PIP_ARGS...]
+  # EXTRA_PIP_ARGS are installed first (the CPU-index torch pin).
+  make_venv() {
+    local dir="$1" py="$2"; shift 2
+    local reqs=() extra=()
+    while [[ $# -gt 0 && "$1" != "--" ]]; do reqs+=("$1"); shift; done
+    if [[ $# -gt 0 ]]; then shift; fi
+    extra=("$@")
+    local want
+    want=$(cat "${reqs[@]}" | shasum -a 256 | cut -d' ' -f1)
+    want="$want-$("$py" -c 'import sys; print(sys.version.split()[0])')-${extra[*]:-}"
+    if [[ -x "$dir/bin/python" && -f "$dir/.atlas-requirements" &&
+          "$(cat "$dir/.atlas-requirements")" == "$want" ]]; then
+      green "  $dir up to date"
+      return
+    fi
+    rm -rf "$dir"
+    "$py" -m venv "$dir"
+    "$dir/bin/pip" install -q --upgrade pip
+    if (( ${#extra[@]} )); then
+      "$dir/bin/pip" install -q "${extra[@]}"
+    fi
+    local r
+    for r in "${reqs[@]}"; do
+      "$dir/bin/pip" install -q -r "$r"
+    done
+    printf '%s\n' "$want" > "$dir/.atlas-requirements"
+    green "  Built $dir"
+  }
+
+  # Lens: torch from the CPU index first (it carries macOS arm64 wheels),
+  # mirroring geometric-lens/Dockerfile, then the pinned requirements.
+  TORCH_PIN=$(grep -E '^torch==' "$ATLAS_ROOT/geometric-lens/requirements.txt")
+  make_venv "$PREFIX/venvs/lens" "$PY312" \
+    "$ATLAS_ROOT/geometric-lens/requirements.txt" -- \
+    "$TORCH_PIN" --index-url https://download.pytorch.org/whl/cpu
+  make_venv "$PREFIX/venvs/v3" "$PY312" "$ATLAS_ROOT/v3-service/requirements.txt"
+  # Sandbox: the executor's own venv (read-only inside the Seatbelt
+  # profile) and the tools venv that `python`/`pip` resolve to for the
+  # code it runs (writable, in the sandbox's private HOME).
+  make_venv "$PREFIX/venvs/sandbox" "$PY313" \
+    "$ATLAS_ROOT/sandbox/requirements-runtime.txt"
+  mkdir -p "$NATIVE_HOME/sandbox/home"
+  make_venv "$NATIVE_HOME/sandbox/home/.venv" "$PY313" \
+    "$ATLAS_ROOT/sandbox/requirements-verify.txt"
+
+  # Toolchains the sandbox verifies with. Not installed automatically —
+  # report what's missing so the operator decides.
+  missing_tools=()
+  for t in node go rustc javac ruby php; do
+    command -v "$t" >/dev/null 2>&1 || missing_tools+=("$t")
+  done
+  if command -v node >/dev/null 2>&1 && ! node --version >/dev/null 2>&1; then
+    yellow "  node is installed but does not run — try: brew reinstall node"
+  fi
+  if (( ${#missing_tools[@]} )); then
+    yellow "  Optional sandbox toolchains not found: ${missing_tools[*]}"
+    yellow "    brew install node go rustup openjdk ruby php   # as needed"
+  fi
+fi
+
+# ---------------------------------------------------------------------------
 # Done
 # ---------------------------------------------------------------------------
+
+if [[ $NATIVE -eq 1 ]]; then
+cat <<EOF
+
+$(bold "Setup complete (native).")
+
+Native binaries: $PREFIX/bin   Service venvs: $PREFIX/venvs
+
+Next steps:
+  1. atlas init --deploy native        # wizard writes .env (ATLAS_DEPLOY=native)
+  2. atlas tier fit --write            # size ctx / slots / KV for this Mac
+                                       #   (64 GB+: --slots 6 --per-slot-cap 65536)
+  3. atlas native install              # write + load the LaunchAgents
+  4. atlas doctor                      # verify install health
+  5. atlas                             # start using ATLAS
+
+See docs/SETUP_MACOS_NATIVE.md.
+EOF
+exit 0
+fi
 
 cat <<EOF
 

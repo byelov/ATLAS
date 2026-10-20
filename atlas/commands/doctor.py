@@ -402,14 +402,118 @@ def _check_metal_native(atlas_root: Optional[str] = None) -> CheckResult:
     # socket probe instead of `nc` since macOS / BSD nc has different
     # flags than GNU nc and may not be on PATH at all.
     if not _port_listening("127.0.0.1", LLAMA_PORT, timeout=2):
+        start = ("atlas native start llama-server"
+                 if compose_config.resolve_deploy(atlas_root or "") == "native"
+                 else "scripts/atlas-llama-macos.sh")
         return CheckResult("metal-native", "warn",
             f"native llama-server installed at {binary} but nothing "
-            f"listening on :{LLAMA_PORT} — start it with scripts/atlas-llama-macos.sh",
+            f"listening on :{LLAMA_PORT} — start it with {start}",
             "Open a separate terminal and run the launcher; this check "
             "will turn green once the server is up and serving.")
 
     return CheckResult("metal-native", "pass",
         f"native llama-server up at {binary}, listening on :{LLAMA_PORT}")
+
+
+def check_native_runtime(atlas_root: str) -> List[CheckResult]:
+    """ATLAS_DEPLOY=native: the pieces `atlas native` expects on disk — the
+    proxy binary, the per-service venvs, the sandbox tools venv, and a
+    Seatbelt profile that sandbox-exec actually accepts."""
+    from atlas.commands import native
+    if sys.platform != "darwin":
+        return [CheckResult("native/runtime", "fail",
+            "ATLAS_DEPLOY=native is macOS-only")]
+    values = compose_config.read_env_file(atlas_root)
+    prefix = os.path.expanduser(os.environ.get("ATLAS_MACOS_PREFIX")
+                                or values.get("ATLAS_MACOS_PREFIX")
+                                or "~/.atlas/macos")
+    setup_hint = "run ./scripts/atlas-setup-macos.sh --native"
+    missing = []
+    proxy_bin = os.path.join(prefix, "bin", "atlas-proxy")
+    if not os.access(proxy_bin, os.X_OK):
+        missing.append(proxy_bin)
+    for venv in ("lens", "v3", "sandbox"):
+        py = os.path.join(prefix, "venvs", venv, "bin", "python")
+        if not os.access(py, os.X_OK):
+            missing.append(py)
+    tools_py = os.path.join(native.native_home(), "sandbox", "home", ".venv",
+                            "bin", "python")
+    if not os.access(tools_py, os.X_OK):
+        missing.append(tools_py)
+    results = []
+    if missing:
+        results.append(CheckResult("native/runtime", "fail",
+            f"native runtime incomplete — {setup_hint}",
+            "missing: " + ", ".join(missing)))
+    else:
+        results.append(CheckResult("native/runtime", "pass",
+            f"proxy binary + service venvs present under {prefix}"))
+
+    # Render the profile the sandbox would run under and have
+    # sandbox-exec load it against /usr/bin/true: catches SBPL syntax
+    # errors and unresolvable paths before launchd does.
+    import tempfile
+    home = os.path.expanduser("~")
+    project = (os.environ.get("ATLAS_PROJECT_DIR")
+               or values.get("ATLAS_PROJECT_DIR") or atlas_root)
+    if not os.path.isabs(project):
+        project = os.path.join(atlas_root, project)
+    secrets = (os.environ.get("ATLAS_SECRETS_DIR")
+               or values.get("ATLAS_SECRETS_DIR") or "secrets")
+    if not os.path.isabs(secrets):
+        secrets = os.path.join(atlas_root, secrets)
+    cfg = native.SeatbeltConfig(
+        project=project,
+        sandbox_home=os.path.join(native.native_home(), "sandbox", "home"),
+        sandbox_tmp=os.path.join(native.native_home(), "sandbox", "tmp"),
+        venv=os.path.join(prefix, "venvs", "sandbox"), secrets=secrets,
+        token_file=os.path.join(secrets, "service-token"),
+        atlas_root=atlas_root, prefix=prefix, real_home=home)
+    with tempfile.NamedTemporaryFile("w", suffix=".sb",
+                                     delete=False) as fh:
+        fh.write(native.render_seatbelt_profile(cfg))
+        profile = fh.name
+    try:
+        rc, out, err = _run(["/usr/bin/sandbox-exec", "-f", profile,
+                             "/usr/bin/true"], timeout=10)
+    finally:
+        os.unlink(profile)
+    if rc == 0:
+        results.append(CheckResult("native/seatbelt", "pass",
+            "sandbox Seatbelt profile loads"))
+    else:
+        results.append(CheckResult("native/seatbelt", "fail",
+            "sandbox-exec rejected the generated sandbox profile",
+            (err or out).strip()[:300]))
+    return results
+
+
+def check_native_services() -> List[CheckResult]:
+    """One result per launchd agent: installed, loaded, healthy."""
+    from atlas.commands import native
+    results = []
+    for service in native.SERVICES:
+        name = f"native/{service}"
+        if not os.path.exists(native.plist_path(service)):
+            results.append(CheckResult(name, "fail",
+                "LaunchAgent not installed — run `atlas native install`"))
+            continue
+        info = native._print_info(service)
+        if not info:
+            results.append(CheckResult(name, "fail",
+                "LaunchAgent installed but not loaded — run "
+                f"`atlas native start {service}`"))
+            continue
+        if native._health(service):
+            results.append(CheckResult(name, "pass",
+                f"running (pid {info.get('pid', '?')}) and healthy"))
+        else:
+            results.append(CheckResult(name, "warn",
+                f"loaded but /health not answering (last exit "
+                f"{info.get('last exit code', '?')})",
+                f"see {native.log_path(service)} — "
+                f"`atlas native logs {service}`"))
+    return results
 
 
 def _compose_ps(project_dir: str) -> List[Dict]:
@@ -1166,6 +1270,37 @@ def main(argv: Optional[List[str]] = None) -> int:
         results.append(r)
         if not args.json:
             _print_result(r, args.verbose, color)
+
+    # Native macOS (ATLAS_DEPLOY=native): launchd agents instead of
+    # containers. Same host-side, health, auth and smoke checks; the
+    # Docker / compose / image checks don't apply.
+    if compose_config.resolve_deploy(atlas_root) == "native":
+        _add(check_arch())
+        _add(_check_metal_native(atlas_root))
+        for item in check_native_runtime(atlas_root):
+            _add(item)
+        native_results = check_native_services()
+        for item in native_results:
+            _add(item)
+        if any(r.status == "pass" for r in native_results):
+            for item in check_health_endpoints():
+                _add(item)
+            for item in check_internal_auth(atlas_root):
+                _add(item)
+            for item in check_status_dimensions():
+                _add(item)
+        _add(check_model_file(atlas_root))
+        _add(check_lens_weights(atlas_root))
+        _add(check_asa_steering(atlas_root))
+        if any(r.status == "pass" for r in native_results):
+            _add(check_sqlite_state())
+        _add(check_tier_match())
+        _add(check_tier_constraints(atlas_root))
+        if args.quick:
+            _add(CheckResult("e2e_smoke", "skip", "skipped (--quick)"))
+        else:
+            _add(check_e2e_smoke())
+        return _emit(results, args, color, already_printed=not args.json)
 
     # 1. Docker
     docker = check_docker()

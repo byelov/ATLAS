@@ -121,6 +121,8 @@ def main(argv: List[str]) -> int:
             "current demo contract and could not be rebuilt.\n"
             "From the ATLAS checkout, run: docker compose up -d --build "
             "atlas-proxy\n"
+            "(native macOS: ./scripts/atlas-setup-macos.sh --native && "
+            "atlas native restart atlas-proxy)\n"
         )
         return 1
 
@@ -138,6 +140,17 @@ def main(argv: List[str]) -> int:
         tok_path = _token.token_path()
         if os.path.isfile(tok_path):
             os.environ["ATLAS_SERVICE_TOKEN_FILE"] = tok_path
+
+    # The TUI budgets each turn as ATLAS_CTX_SIZE / ATLAS_PARALLEL_SLOTS
+    # (tui/model.go configuredContextTokens) and falls back to 32768/1
+    # when they are absent — so a `tier fit` that raised the per-slot
+    # context would go unused. Hand it the sizing the server runs with.
+    from atlas import compose as compose_config
+    from atlas import env as cli_env
+    _env_values = compose_config.read_env_file(cli_env.atlas_root())
+    for key in ("ATLAS_CTX_SIZE", "ATLAS_PARALLEL_SLOTS"):
+        if not os.environ.get(key) and _env_values.get(key):
+            os.environ[key] = _env_values[key]
 
     # Default --log to a stable path under ~/.cache so debugging the
     # TUI doesn't require the user to remember a flag. Alt-screen mode

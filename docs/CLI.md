@@ -42,6 +42,7 @@ The top-level `atlas` binary also dispatches to non-TUI subcommands:
 | `atlas lens check \| build \| retrain \| publish` | Geometric Lens compat probe + per-model training (see below). |
 | `atlas asa check \| build \| publish` | ASA control-vector compat probe + per-model training + publish (see below). |
 | `atlas publish` | One-step publish: lens artifacts + ASA vector to HF, one registry PR covering both. `--lens-only` / `--asa-only` delegate to the per-component flows. |
+| `atlas native install \| uninstall \| start \| stop \| restart \| status \| logs \| project` | **macOS, `ATLAS_DEPLOY=native`:** run every service as a launchd agent instead of a container — no Docker. `install` writes and loads `~/Library/LaunchAgents/ai.atlas.<service>.plist`; `status` shows launchd state + `/health` per service; `logs <service> [-f]` tails `~/Library/Logs/atlas/<service>.log`; `project <dir>` re-points the Seatbelt-confined sandbox at a project. See [SETUP_MACOS_NATIVE.md](SETUP_MACOS_NATIVE.md). |
 | `atlas compose <args...>` | `docker compose` passthrough with ATLAS's compose file set (base file + the backend overlay resolved from `ATLAS_BACKEND`). E.g. `atlas compose ps`, `atlas compose logs -f atlas-proxy`. |
 | `atlas upgrade [--to TAG] [--dry-run] [--skip-smoke] [--yes]` | Staged upgrade: records a restore point (current tag + image digests + `.env` backup), stages the target images, starts them, waits for readiness, runs a quick-doctor smoke check, and finalizes. **Any failure automatically restores the previous release.** Default target is `latest`. `--dry-run` previews the plan without applying. Cosign signature verification of the target images is best-effort: it is skipped when `cosign` isn't installed or `ATLAS_UPGRADE_SKIP_VERIFY=1` is set, and a signature that fails verification aborts the upgrade and restores the previous release. |
 | `atlas diagnostics collect [--output FILE] [--log-lines N]` | Write a shareable JSON diagnostic bundle: versions, platform, filtered config (secret-ish values masked, service token dropped), per-service health plus proxy readiness and calibration status, `docker compose images` output, recent logs (private-value-filtered), and the doctor report. Source code is excluded; safe to attach to an issue after review. |
@@ -411,6 +412,14 @@ If you write code from one shell and `atlas tui` is running in another
 that's pointing at a different directory, restart the TUI in the right
 cwd to re-align.
 
+**Native macOS (`ATLAS_DEPLOY=native`).** There is no `/workspace`: the
+launchd proxy reads and writes the directory each request names (the TUI's
+cwd). Only the sandbox has a fixed root, and V3 build verification needs it
+to equal the project directory — so when `atlas` starts somewhere else it
+writes `ATLAS_PROJECT_DIR=$(pwd)` to `.env` and restarts the sandbox agent
+(~2 s; `atlas native project <dir>` does the same by hand).
+`ATLAS_AUTO_WORKSPACE=0` disables it.
+
 ---
 
 ## Environment variables
@@ -482,6 +491,7 @@ atlas tier fit                          # fit the model configured in .env
 atlas tier fit models/other.gguf        # fit a specific GGUF
 atlas tier fit --write                  # apply the result to .env
 atlas tier fit --slots 2                # size for 2 parallel slots instead of 4
+atlas tier fit --slots 6 --per-slot-cap 65536   # more and longer slots (large unified-memory Macs)
 atlas tier fit --json                   # machine-readable ({model, meta, fit, env})
 ```
 
@@ -499,11 +509,21 @@ With `--write` it updates `ATLAS_CTX_SIZE`, `ATLAS_PARALLEL_SLOTS`,
 `ATLAS_KV_TYPE_K/V`, `ATLAS_UBATCH`, and `ATLAS_BATCH` in the **ATLAS
 install's** `.env` (path printed as `wrote …`, resolved the same way as
 `atlas doctor` and `atlas bench`); apply with
-`docker compose up -d llama-server --no-deps --force-recreate`. If the model
+`docker compose up -d llama-server --no-deps --force-recreate` (native
+macOS: `atlas native restart llama-server`). If the model
 can't fit at even the minimum acceptable context (8k per slot, q8_0), it names
 the largest quant file size that *would* fit and exits 1. The server runs with
 `--fit off`, so an oversized config refuses to start rather than demoting
 layers to CPU.
+
+Per-slot context is capped at 32768 by default; `--per-slot-cap` raises the
+cap (the model's training context still bounds it).
+
+**Apple Silicon.** The budget is the Metal working-set limit, not total unified
+memory: macOS lets the GPU wire ~2/3 of RAM up to 36 GiB and ~3/4 above
+(`sysctl iogpu.wired_limit_mb` overrides it), minus 8 GiB kept for macOS and
+the native services. On a 128 GB M1 Ultra that is 96 GiB. K and V always get
+the same cache type (Metal's flash attention rejects mixed types).
 
 Run it whenever `ATLAS_MODEL_FILE` or the GPU changes; `atlas onboard` prints
 the recommendation and flags a stale `.env`. For the full VRAM-budget

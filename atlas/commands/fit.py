@@ -22,16 +22,23 @@ errs toward smaller-but-safe):
   reserve  = 1.9 GiB (CUDA context, graphs, embedding buffers, fragmentation;
              calibrated against measured llama-server footprints)
 
+Apple Silicon: the "VRAM" figure is the Metal working-set limit, not total
+unified memory. macOS lets the GPU wire ~2/3 of RAM up to 36 GiB and ~3/4
+above (`sysctl iogpu.wired_limit_mb` overrides it), and the host keeps a
+reserve for macOS plus the natively-run ATLAS services.
+
 Usage:
     atlas tier fit                       # size the model configured in .env
     atlas tier fit /path/to/model.gguf   # size a specific GGUF
     atlas tier fit --write               # also update .env with the result
+    atlas tier fit --slots 6 --per-slot-cap 65536   # more / longer slots
 """
 
 import argparse
 import json
 import os
 import struct
+import subprocess
 from dataclasses import dataclass, asdict
 from typing import Dict, List, Optional
 
@@ -57,6 +64,12 @@ WEIGHTS_OVERHEAD = 1.02    # mmap rounding / tensor alignment
 PER_SLOT_MIN = 8192        # below this a slot can't hold prompt + generation
 PER_SLOT_CAP = 32768       # diminishing returns past this for ATLAS workloads
 CTX_ROUND = 1024           # llama-server context granularity per slot
+
+# Apple Silicon unified memory (see module docstring).
+METAL_WIRED_FRACTION_SMALL = 2 / 3   # RAM <= METAL_WIRED_SMALL_MAX_GIB
+METAL_WIRED_FRACTION_LARGE = 0.75
+METAL_WIRED_SMALL_MAX_GIB = 36
+METAL_HOST_RESERVE_GIB = 8.0         # macOS + lens/v3/sandbox/proxy processes
 
 # When a model declares a sliding window but not the local/global layer
 # pattern, assume one global layer in every PATTERN_DEFAULT (the common
@@ -211,8 +224,38 @@ def _layer_dims(meta: GGUFMeta):
     return global_dims, local_dims
 
 
+def metal_gpu_budget_gib(ram_gib: float,
+                         wired_limit_mb: Optional[int] = None) -> float:
+    """GPU-usable unified memory on Apple Silicon.
+
+    `wired_limit_mb` is `sysctl iogpu.wired_limit_mb` (0/None = macOS
+    default). The result never exceeds RAM minus the host reserve."""
+    if wired_limit_mb:
+        limit = wired_limit_mb / 1024
+    elif ram_gib <= METAL_WIRED_SMALL_MAX_GIB:
+        limit = ram_gib * METAL_WIRED_FRACTION_SMALL
+    else:
+        limit = ram_gib * METAL_WIRED_FRACTION_LARGE
+    return max(0.0, min(limit, ram_gib - METAL_HOST_RESERVE_GIB))
+
+
+def _read_wired_limit_mb() -> Optional[int]:
+    try:
+        p = subprocess.run(["sysctl", "-n", "iogpu.wired_limit_mb"],
+                           capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if p.returncode != 0:
+        return None
+    try:
+        return int(p.stdout.strip())
+    except ValueError:
+        return None
+
+
 def fit_runtime_knobs(meta: GGUFMeta, vram_gib: float,
-                      slots: int = 4) -> FitResult:
+                      slots: int = 4,
+                      per_slot_cap: int = PER_SLOT_CAP) -> FitResult:
     """Largest context + micro-batch whose full budget fits in `vram_gib`."""
     weights = meta.file_size * WEIGHTS_OVERHEAD / GIB
     global_dims, local_dims = _layer_dims(meta)
@@ -237,13 +280,13 @@ def fit_runtime_knobs(meta: GGUFMeta, vram_gib: float,
             if global_dims <= 0:
                 # Pure sliding-window model: KV doesn't grow with context,
                 # so context is bounded only by the per-slot cap.
-                ctx_total = PER_SLOT_CAP * slots
+                ctx_total = per_slot_cap * slots
             else:
                 ctx_total = int(budget * GIB / (global_dims * bpe))
             per_slot = ctx_total // slots
             if meta.n_ctx_train:
                 per_slot = min(per_slot, meta.n_ctx_train)
-            per_slot = min(per_slot, PER_SLOT_CAP)
+            per_slot = min(per_slot, per_slot_cap)
             per_slot = (per_slot // CTX_ROUND) * CTX_ROUND
             if per_slot < PER_SLOT_MIN:
                 continue
@@ -267,7 +310,7 @@ def fit_runtime_knobs(meta: GGUFMeta, vram_gib: float,
             # A larger ubatch (faster prompt processing) already yields an
             # acceptable context; smaller ubatch can only trade speed for
             # context we cap anyway.
-            if best.per_slot >= PER_SLOT_CAP:
+            if best.per_slot >= per_slot_cap:
                 break
 
     if best is not None:
@@ -404,13 +447,25 @@ def emit_fit(args: argparse.Namespace, color: bool) -> int:
         _safe_print("  No GPU with reported VRAM detected — fit requires one.")
         return 1
     vram_gib = float(gpu.vram_gb)
+    gpu_label = f"{gpu.name} ({vram_gib:.1f} GiB)"
+    if getattr(gpu, "vendor", "") == "apple":
+        ram_gib = vram_gib
+        vram_gib = metal_gpu_budget_gib(ram_gib, _read_wired_limit_mb())
+        gpu_label = (f"{gpu.name} ({vram_gib:.1f} GiB Metal budget of "
+                     f"{ram_gib:.1f} GiB unified)")
 
     slots = getattr(args, "slots", None)
     slots = 4 if slots is None else int(slots)
     if slots < 1:
         _safe_print("  --slots must be at least 1.")
         return 2
-    result = fit_runtime_knobs(meta, vram_gib, slots=slots)
+    per_slot_cap = getattr(args, "per_slot_cap", None)
+    per_slot_cap = PER_SLOT_CAP if per_slot_cap is None else int(per_slot_cap)
+    if per_slot_cap < PER_SLOT_MIN:
+        _safe_print(f"  --per-slot-cap must be at least {PER_SLOT_MIN}.")
+        return 2
+    result = fit_runtime_knobs(meta, vram_gib, slots=slots,
+                               per_slot_cap=per_slot_cap)
 
     if getattr(args, "json", False):
         payload = {"model": model, "meta": asdict(meta),
@@ -424,7 +479,7 @@ def emit_fit(args: argparse.Namespace, color: bool) -> int:
     _safe_print(f"atlas tier fit — {os.path.basename(model)}")
     _safe_print(f"  arch {meta.architecture} | {meta.n_layers} layers | "
                 f"{meta.n_embd}-dim | head_dim {meta.head_dim} | {meta.swa_note}")
-    _safe_print(f"  GPU: {gpu.name} ({vram_gib:.1f} GiB)")
+    _safe_print(f"  GPU: {gpu_label}")
     _safe_print(f"  budget: weights {result.weights_gib} + KV {result.kv_gib} "
                 f"+ compute {result.compute_gib} + reserve {result.reserve_gib} "
                 f"GiB of {result.vram_gib} GiB")
@@ -447,8 +502,12 @@ def emit_fit(args: argparse.Namespace, color: bool) -> int:
             _safe_print(f"  note: that is the ATLAS install's .env — NOT "
                         f"{cwd_root}/.env. docker compose reads the .env "
                         f"next to the docker-compose.yml it runs from.")
-        _safe_print("  apply: docker compose up -d llama-server --no-deps "
-                    "--force-recreate")
+        from atlas import compose as compose_config
+        if compose_config.resolve_deploy(_atlas_root()) == "native":
+            _safe_print("  apply: atlas native restart llama-server")
+        else:
+            _safe_print("  apply: docker compose up -d llama-server "
+                        "--no-deps --force-recreate")
     else:
         _safe_print("  (re-run with --write to update .env)")
     return 0

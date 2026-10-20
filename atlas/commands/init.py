@@ -305,7 +305,8 @@ def _step_select_model(profile: tier.TierProfile,
         # prerequisite so users know they need to run it before bringing
         # the stack up.
         if (backend_id == "metal" and probe.platform == "darwin"
-                and not args.backend):
+                and not args.backend
+                and getattr(args, "deploy", None) != "native"):
             _safe_print(f"  {GREEN if color else ''}Apple Silicon detected. "
                         f"Recommended setup: native Metal inference + Docker "
                         f"for the supporting services.{RESET if color else ''}")
@@ -316,6 +317,8 @@ def _step_select_model(profile: tier.TierProfile,
                         f"with Metal. Full instructions in docs/SETUP_MACOS.md.")
             _safe_print("")
             _safe_print("  Other options:")
+            _safe_print("    --deploy native    every service native under "
+                        "launchd, no Docker (docs/SETUP_MACOS_NATIVE.md)")
             _safe_print("    --backend vulkan   Docker-only (no native build, "
                         "slower)")
             if not _confirm("Continue with the recommended setup?",
@@ -504,13 +507,17 @@ def _render_env(m: model_registry.Model, profile: tier.TierProfile,
                  selected_gpu: Optional[tier.GPUInfo],
                  models_dir: str, atlas_root: str, image_tag: str,
                  ghcr_owner: str,
-                 backend_override: Optional[str] = None) -> str:
+                 backend_override: Optional[str] = None,
+                 deploy: Optional[str] = None) -> str:
     """Compose the .env body. Order is stable for diff-friendliness.
 
     `backend_override` (PC-114): when set, takes precedence over the
     vendor-derived backend. Set by `atlas init --backend vulkan` (or
     the wizard's Vulkan-fallback path when the native backend isn't
     packaged).
+
+    `deploy="native"`: the fully native macOS path (launchd agents, no
+    Docker — `atlas native`). Implies the metal backend.
     """
     # models_dir written as a relative path when it's the default
     # <atlas_root>/models, absolute otherwise — keeps `.env` portable
@@ -536,14 +543,21 @@ def _render_env(m: model_registry.Model, profile: tier.TierProfile,
 
     sandbox_mem, sandbox_pids, sandbox_cpus, sandbox_uid, sandbox_gid = _sandbox_limits()
 
+    kv_k, kv_v = profile.kv_cache_k, profile.kv_cache_v
+    if backend_id == "metal" and kv_k != kv_v:
+        # Metal's flash-attention kernel rejects mixed K/V cache types
+        # (ggml-metal-device.m), which moves attention onto the CPU. Use
+        # the K type for both; `atlas tier fit --write` sizes it properly.
+        kv_v = kv_k
+
     keys = {
         "ATLAS_MODELS_DIR": models_value,
         "ATLAS_MODEL_FILE": m.model_file,
         "ATLAS_MODEL_NAME": m.model_file.rsplit(".", 1)[0],
         "ATLAS_CTX_SIZE": str(profile.context_length),
         "ATLAS_PARALLEL_SLOTS": str(profile.parallel_slots),
-        "ATLAS_KV_TYPE_K": profile.kv_cache_k,
-        "ATLAS_KV_TYPE_V": profile.kv_cache_v,
+        "ATLAS_KV_TYPE_K": kv_k,
+        "ATLAS_KV_TYPE_V": kv_v,
         "ATLAS_BACKEND": backend_id,
         "ATLAS_GPU_VENDOR": vendor,
         "ATLAS_GPU_INDEX": gpu_index,
@@ -569,6 +583,8 @@ def _render_env(m: model_registry.Model, profile: tier.TierProfile,
         "ATLAS_PROXY_UID": sandbox_uid,
         "ATLAS_PROXY_GID": sandbox_gid,
     }
+    if deploy == "native":
+        keys["ATLAS_DEPLOY"] = "native"
 
     gpu_descr = (f"{selected_gpu.name} ({selected_gpu.vram_gb:.1f} GB VRAM)"
                  if selected_gpu else "none")
@@ -596,6 +612,19 @@ def _render_env(m: model_registry.Model, profile: tier.TierProfile,
         lines.append(
             "# Vulkan is the universal fallback (~20-40% slower than tuned "
             "native backends) — works on AMD/Intel/Snapdragon/Apple-via-MoltenVK/CPU.")
+        lines.append("")
+    elif backend_id == "metal" and deploy == "native":
+        lines.append(
+            "# NOTE (Metal, native): every service runs as a launchd agent "
+            "— no Docker. The sandbox is confined by a Seatbelt profile.")
+        lines.append(
+            "#   ./scripts/atlas-setup-macos.sh --native   # one-time: builds "
+            "llama.cpp, the proxy and the service venvs")
+        lines.append(
+            "#   atlas native install                    # write + load the "
+            "LaunchAgents")
+        lines.append(
+            "# See docs/SETUP_MACOS_NATIVE.md.")
         lines.append("")
     elif backend_id == "metal":
         lines.append(
@@ -637,7 +666,8 @@ def _step_write_env(m: model_registry.Model, profile: tier.TierProfile,
     body = _render_env(m, profile, selected_gpu, models_dir, atlas_root,
                        image_tag=args.image_tag,
                        ghcr_owner=args.ghcr_owner,
-                       backend_override=args.backend)
+                       backend_override=args.backend,
+                       deploy=getattr(args, "deploy", None))
     if args.dry_run:
         _safe_print(f"  (dry-run) would write {env_path} ({len(body)} bytes)")
         return env_path, None
@@ -794,6 +824,10 @@ def _refuse_if_already_configured(atlas_root: str, args: argparse.Namespace,
 # Main
 # ---------------------------------------------------------------------------
 
+def _host_is_macos() -> bool:
+    return sys.platform == "darwin"
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         prog="atlas init",
@@ -830,8 +864,25 @@ def main(argv: Optional[List[str]] = None) -> int:
              "`metal` is the macOS hybrid path (#32) — native llama-server "
              "+ Docker for the rest. Requires running ./scripts/"
              "atlas-setup-macos.sh first. See docs/SETUP_MACOS.md.")
+    parser.add_argument("--deploy", default=None,
+        choices=["docker", "native"],
+        help="`native` (macOS Apple Silicon): run every service as a "
+             "launchd agent with no Docker; the sandbox is confined by a "
+             "Seatbelt profile. Implies --backend metal. Requires "
+             "./scripts/atlas-setup-macos.sh --native. See "
+             "docs/SETUP_MACOS_NATIVE.md.")
     parser.add_argument("--no-color", action="store_true")
     args = parser.parse_args(argv)
+    if args.deploy == "native":
+        if not _host_is_macos():
+            _safe_print("atlas init: --deploy native is macOS-only.")
+            return 2
+        if args.backend not in (None, "metal"):
+            _safe_print("atlas init: --deploy native runs llama-server on "
+                        "Metal; it can't be combined with --backend "
+                        f"{args.backend}.")
+            return 2
+        args.backend = "metal"
 
     color = (not args.no_color) and sys.stdout.isatty()
     atlas_root = _find_atlas_root()
@@ -906,7 +957,19 @@ def main(argv: Optional[List[str]] = None) -> int:
     if not args.dry_run:
         _safe_print(f"{GREEN if color else ''}Setup complete.{RESET if color else ''}")
         _safe_print("Next:")
-        if backend_id == "metal":
+        if backend_id == "metal" and args.deploy == "native":
+            _safe_print("  1. ./scripts/atlas-setup-macos.sh --native   "
+                        "# one-time: llama.cpp, proxy, service venvs")
+            _safe_print("  2. atlas tier fit --write     # size ctx/slots/KV "
+                        "for this model + Mac (on 64 GB+, add "
+                        "--slots 6 --per-slot-cap 65536)")
+            _safe_print("  3. atlas native install       # write + load the "
+                        "LaunchAgents (starts the stack)")
+            _safe_print("  4. atlas doctor               # verify install health")
+            _safe_print("  5. atlas                      # start using ATLAS")
+            _safe_print("")
+            _safe_print("  See docs/SETUP_MACOS_NATIVE.md for the full walkthrough.")
+        elif backend_id == "metal":
             # #32 hybrid path — four steps because llama-server runs
             # natively on macOS while the rest stay in Docker. Setup
             # script is idempotent so re-runs are cheap.
@@ -951,6 +1014,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             "ghcr_owner": args.ghcr_owner,
             "dry_run": args.dry_run,
             "backend": backend_id,
+            "deploy": args.deploy or "docker",
             "gpu": ({"vendor": selected_gpu.vendor, "name": selected_gpu.name,
                      "vram_gb": round(selected_gpu.vram_gb, 1),
                      "index": selected_gpu.index,

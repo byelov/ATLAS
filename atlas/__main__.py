@@ -21,6 +21,7 @@ _SUBCOMMAND_HELP = [
     ("publish", "publish lens + ASA artifacts in one step"),
     ("bench",   "run benchmarks with live progress"),
     ("compose", "docker compose with ATLAS's compose files"),
+    ("native",  "macOS: run the stack under launchd (no Docker)"),
     ("upgrade", "staged upgrade with auto-restore on failure"),
     ("rollback","return the deployment to a previous release"),
     ("diagnostics", "collect a filtered diagnostic bundle"),

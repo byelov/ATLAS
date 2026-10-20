@@ -147,7 +147,7 @@ Then in any project directory, run `atlas`.
 | Python | 3.9+ |
 | Disk | ~20 GB CUDA / ~22 GB ROCm (model weights + container images) |
 
-Apple Silicon runs natively through the macOS hybrid Metal path (native llama-server + Docker for the rest - see **[SETUP_MACOS.md](docs/SETUP_MACOS.md)**); Intel Arc (SYCL) is on the roadmap. For the manual install path (Docker Compose, bare-metal, K3s) and the full set of bootstrap flags, see **[SETUP.md](docs/SETUP.md)**.
+Apple Silicon runs natively through the macOS hybrid Metal path (native llama-server + Docker for the rest - see **[SETUP_MACOS.md](docs/SETUP_MACOS.md)**), or with no Docker at all: every service as a launchd agent and the sandbox under a Seatbelt profile (**[SETUP_MACOS_NATIVE.md](docs/SETUP_MACOS_NATIVE.md)**, sized for an M1 Ultra Mac Studio); Intel Arc (SYCL) is on the roadmap. For the manual install path (Docker Compose, bare-metal, K3s) and the full set of bootstrap flags, see **[SETUP.md](docs/SETUP.md)**.
 
 ---
 
