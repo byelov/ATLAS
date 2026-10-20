@@ -96,7 +96,7 @@ fi
 # ---------------------------------------------------------------------------
 # Resolve the runtime knobs. These fallback defaults are deliberately
 # SMALLER than the Linux/Docker path (ctx 32768 vs 131072, quantized
-# q8_0/q4_0 KV cache vs f16/f16, 1 parallel slot vs 4) to stay within the
+# q8_0/q8_0 KV cache vs f16/f16, 1 parallel slot vs 4) to stay within the
 # unified-memory budget of a typical Mac — the f16/131072/4 Docker defaults
 # roughly 10x the KV-cache footprint and can fail to allocate on smaller
 # machines. A real install never hits these fallbacks: `atlas init` / `atlas
@@ -106,12 +106,15 @@ fi
 
 CTX_LENGTH="${ATLAS_CTX_SIZE:-${CONTEXT_LENGTH:-32768}}"
 KV_CACHE_K="${ATLAS_KV_TYPE_K:-${KV_CACHE_TYPE_K:-q8_0}}"
-KV_CACHE_V="${ATLAS_KV_TYPE_V:-${KV_CACHE_TYPE_V:-q4_0}}"
+# K and V default to the SAME type: Metal's flash-attention kernel rejects
+# mixed K/V types (ggml-metal-device.m), which moves attention to the CPU.
+KV_CACHE_V="${ATLAS_KV_TYPE_V:-${KV_CACHE_TYPE_V:-q8_0}}"
 PARALLEL="${ATLAS_PARALLEL_SLOTS:-${PARALLEL_SLOTS:-1}}"
 BATCH_SIZE="${ATLAS_BATCH:-${BATCH_SIZE:-1024}}"
 UBATCH_SIZE="${ATLAS_UBATCH:-${UBATCH_SIZE:-1024}}"
 PORT="${OVERRIDE_PORT:-${ATLAS_LLAMA_PORT:-8080}}"
 HOST="${ATLAS_LLAMA_HOST:-127.0.0.1}"
+EMBED_POOLING="${ATLAS_EMBED_POOLING:-mean}"
 
 case "$BATCH_SIZE:$UBATCH_SIZE" in
   *[!0-9:]*|:*|*:)
@@ -125,6 +128,11 @@ if [[ "$BATCH_SIZE" -eq 0 || "$UBATCH_SIZE" -eq 0 ]]; then
 fi
 if [[ "$BATCH_SIZE" -gt "$UBATCH_SIZE" ]]; then
   BATCH_SIZE="$UBATCH_SIZE"
+fi
+if [[ "$KV_CACHE_K" != "$KV_CACHE_V" ]]; then
+  echo "warning: KV cache K=$KV_CACHE_K / V=$KV_CACHE_V differ; Metal flash" >&2
+  echo "  attention needs matching types, so attention will run on the CPU." >&2
+  echo "  Set ATLAS_KV_TYPE_K and ATLAS_KV_TYPE_V to the same value." >&2
 fi
 
 # Resolve model path. ATLAS_MODELS_DIR is "./models" (relative to atlas root)
@@ -198,6 +206,7 @@ ATLAS llama-server (native macOS Metal) — #32 hybrid path
   Context length:       $CTX_LENGTH
   Parallel slots:       $PARALLEL
   KV cache K / V:       $KV_CACHE_K / $KV_CACHE_V
+  Embedding pooling:    $EMBED_POOLING
   Port:                 $PORT
   Host:                 $HOST
   Batch / micro-batch:  $BATCH_SIZE / $UBATCH_SIZE
@@ -207,7 +216,8 @@ ATLAS llama-server (native macOS Metal) — #32 hybrid path
 EOF
 
 # ---------------------------------------------------------------------------
-# Launch. Same flags as the docker entrypoint with two differences:
+# Launch. Same flags as the docker entrypoint (including --pooling, which
+# the lens's embedding contract depends on) with two differences:
 #   --host 127.0.0.1 bind only on loopback by default. Docker Desktop's
 #                    host.docker.internal gateway can still reach host
 #                    loopback services. Set ATLAS_LLAMA_HOST explicitly
@@ -237,6 +247,7 @@ SERVER_ARGS=(
   --slot-save-path "$SLOT_SAVE_PATH"
   --ctx-checkpoints 0
   --embeddings
+  --pooling "$EMBED_POOLING"
   --jinja
 )
 # Bash 3.2 (the version shipped by macOS) errors under `set -u` when an empty
