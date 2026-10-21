@@ -39,7 +39,7 @@ import json
 import os
 import struct
 import subprocess
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from typing import Dict, List, Optional
 
 from atlas.gguf import read_gguf_kv
@@ -98,6 +98,10 @@ class GGUFMeta:
     sliding_window: int               # 0 = full attention everywhere
     local_mask: List[bool]            # per-layer: True = sliding-window layer
     swa_note: str                     # how the mask was derived
+    # Hybrid recurrent models: per-layer True = recurrent layer (no KV cache),
+    # plus the fixed f32 state each slot keeps for those layers.
+    recurrent_mask: List[bool] = field(default_factory=list)
+    recurrent_state_bytes: int = 0    # per slot, all recurrent layers
 
 
 def read_gguf_meta(path: str) -> GGUFMeta:
@@ -160,6 +164,21 @@ def read_gguf_meta(path: str) -> GGUFMeta:
         swa_note = (f"window {sliding}, assumed 1 global per {p} layers"
                     + ("" if pattern else " (pattern not in GGUF)"))
 
+    # Hybrid recurrent models (Qwen3.5 / Qwen3-Next: Gated DeltaNet with a
+    # full-attention layer every `full_attention_interval` layers). Only the
+    # attention layers have a KV cache; each recurrent layer keeps a fixed
+    # per-slot state instead — llama.cpp's n_embd_r + n_embd_s floats.
+    interval = int(a("full_attention_interval", 0) or 0)
+    recurrent_mask = ([(i + 1) % interval != 0 for i in range(n_layers)]
+                      if interval > 1 else [False] * n_layers)
+    d_conv = int(a("ssm.conv_kernel", 0) or 0)
+    d_inner = int(a("ssm.inner_size", 0) or 0)
+    d_state = int(a("ssm.state_size", 0) or 0)
+    n_group = int(a("ssm.group_count", 0) or 0)
+    state_floats = (max(d_conv - 1, 0) * (d_inner + 2 * n_group * d_state)
+                    + d_state * d_inner)
+    recurrent_state_bytes = sum(recurrent_mask) * state_floats * 4
+
     return GGUFMeta(
         path=path,
         file_size=os.path.getsize(path),
@@ -176,6 +195,8 @@ def read_gguf_meta(path: str) -> GGUFMeta:
         sliding_window=sliding,
         local_mask=local_mask,
         swa_note=swa_note,
+        recurrent_mask=recurrent_mask,
+        recurrent_state_bytes=recurrent_state_bytes,
     )
 
 
@@ -214,9 +235,14 @@ class FitResult:
 def _layer_dims(meta: GGUFMeta):
     """Per-layer (k+v) element width, split into global-attention layers and
     sliding-window layers via the per-layer mask. The two groups can use
-    different head dimensions (key_length vs key_length_swa)."""
+    different head dimensions (key_length vs key_length_swa). Recurrent
+    layers of a hybrid model have no KV cache."""
     global_dims = local_dims = 0
-    for kvh, is_local in zip(meta.kv_heads, meta.local_mask):
+    recurrent = meta.recurrent_mask or [False] * len(meta.kv_heads)
+    for kvh, is_local, is_recurrent in zip(meta.kv_heads, meta.local_mask,
+                                           recurrent):
+        if is_recurrent:
+            continue
         if is_local:
             local_dims += kvh * (meta.k_len_swa + meta.v_len_swa)
         else:
@@ -259,6 +285,7 @@ def fit_runtime_knobs(meta: GGUFMeta, vram_gib: float,
     """Largest context + micro-batch whose full budget fits in `vram_gib`."""
     weights = meta.file_size * WEIGHTS_OVERHEAD / GIB
     global_dims, local_dims = _layer_dims(meta)
+    state_cost = slots * meta.recurrent_state_bytes / GIB
 
     best = None
     for ubatch in (2048, 1024, 512):
@@ -266,7 +293,7 @@ def fit_runtime_knobs(meta: GGUFMeta, vram_gib: float,
                       ubatch * meta.n_embd * COMPUTE_BYTES_PER_TOK_EMBD / GIB)
         for kv_type in ("f16", "q8_0"):
             bpe = KV_BYTES[kv_type]
-            budget = vram_gib - weights - compute - RESERVE_GIB
+            budget = vram_gib - weights - compute - RESERVE_GIB - state_cost
             # llama.cpp sizes the sliding-window cache at one batch beyond
             # slots × window, so bill the same.
             local_tokens = slots * meta.sliding_window + ubatch
@@ -291,7 +318,8 @@ def fit_runtime_knobs(meta: GGUFMeta, vram_gib: float,
             if per_slot < PER_SLOT_MIN:
                 continue
             ctx_total = per_slot * slots
-            kv_gib = ctx_total * global_dims * bpe / GIB + local_cost
+            kv_gib = (ctx_total * global_dims * bpe / GIB + local_cost
+                      + state_cost)
             note = meta.swa_note if "assumed" in meta.swa_note else ""
             result = FitResult(
                 fits=True, ctx_total=ctx_total, per_slot=per_slot,
@@ -326,7 +354,8 @@ def fit_runtime_knobs(meta: GGUFMeta, vram_gib: float,
     def _min_kv(n_slots):
         return (PER_SLOT_MIN * n_slots * global_dims * bpe / GIB +
                 ((n_slots * meta.sliding_window + 512) * local_dims * bpe / GIB
-                 if local_dims else 0.0))
+                 if local_dims else 0.0)
+                + n_slots * meta.recurrent_state_bytes / GIB)
 
     def _max_file(n_slots):
         return (vram_gib - RESERVE_GIB - compute

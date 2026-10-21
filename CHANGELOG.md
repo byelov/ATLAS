@@ -54,6 +54,7 @@
 
 ### Apple Silicon sizing and speed
 - `atlas tier fit` budgets the Metal working-set limit (≈2/3 of RAM up to 36 GiB, ≈3/4 above, `iogpu.wired_limit_mb` if set, minus an 8 GiB host reserve) instead of all of unified memory. New `--per-slot-cap` raises the 32K per-slot ceiling, e.g. `--slots 6 --per-slot-cap 65536` on a 128 GB M1 Ultra.
+- `atlas tier fit` bills KV only for the attention layers of hybrid recurrent models (`full_attention_interval`: Qwen3.5 / Qwen3-Next keep KV in 8 of 32 layers) and adds their fixed per-slot recurrent state. It over-estimated Qwen3.5-9B's cache 4× (48 GiB for 6 × 64K f16; llama-server allocates 12 GiB + 0.3 GiB of state).
 - The Mac launcher and `atlas init` no longer pick mixed K/V cache types (`q8_0`/`q4_0`): Metal's flash-attention kernel rejects mixed types, which moved attention to the CPU. The launcher warns when they're set explicitly.
 - `scripts/atlas-llama-macos.sh` passes `--pooling` (`ATLAS_EMBED_POOLING`, default `mean`) like the Docker entrypoint; the lens's embedding contract depends on it.
 - The TUI launcher passes `ATLAS_CTX_SIZE`/`ATLAS_PARALLEL_SLOTS` from `.env` to the TUI, which otherwise budgeted every turn as 32768/1 regardless of sizing.

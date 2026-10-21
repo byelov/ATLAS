@@ -47,3 +47,64 @@ def test_per_slot_cap_allows_longer_slots_when_memory_allows():
     assert longer.per_slot == 65536
     assert longer.parallel == 6
     assert longer.kv_type_k == longer.kv_type_v == "f16"
+
+
+def _write_gguf(path, kv):
+    """Minimal GGUF v3 header: no tensors, string / u32 metadata only."""
+    import struct
+
+    def s(text):
+        raw = text.encode()
+        return struct.pack("<Q", len(raw)) + raw
+
+    out = b"GGUF" + struct.pack("<IQQ", 3, 0, len(kv))
+    for key, value in kv.items():
+        if isinstance(value, str):
+            out += s(key) + struct.pack("<I", 8) + s(value)
+        else:
+            out += s(key) + struct.pack("<II", 4, value)
+    path.write_bytes(out)
+
+
+def test_hybrid_model_bills_kv_only_for_attention_layers(tmp_path):
+    # Qwen3.5-9B's geometry: Gated DeltaNet with full attention every 4th
+    # layer. llama-server allocates KV for 8 of 32 layers (12288 MiB at
+    # 6 × 65536 f16) plus 301.5 MiB of recurrent state for 6 slots; billing
+    # KV for all 32 layers over-estimated the cache 4×.
+    from atlas.commands.fit import read_gguf_meta
+    gguf = tmp_path / "hybrid.gguf"
+    _write_gguf(gguf, {
+        "general.architecture": "qwen35",
+        "qwen35.block_count": 32,
+        "qwen35.context_length": 262144,
+        "qwen35.embedding_length": 4096,
+        "qwen35.attention.head_count": 16,
+        "qwen35.attention.head_count_kv": 4,
+        "qwen35.attention.key_length": 256,
+        "qwen35.attention.value_length": 256,
+        "qwen35.ssm.conv_kernel": 4,
+        "qwen35.ssm.state_size": 128,
+        "qwen35.ssm.group_count": 16,
+        "qwen35.ssm.time_step_rank": 32,
+        "qwen35.ssm.inner_size": 4096,
+        "qwen35.full_attention_interval": 4,
+    })
+    meta = read_gguf_meta(str(gguf))
+    assert meta.recurrent_mask.count(False) == 8
+    assert meta.recurrent_mask[3] is False and meta.recurrent_mask[0] is True
+    assert meta.recurrent_state_bytes * 6 == int(301.5 * 2 ** 20)
+
+    meta.file_size = int(7 * GIB)
+    result = fit_runtime_knobs(meta, vram_gib=96, slots=6,
+                               per_slot_cap=65536)
+    assert result.per_slot == 65536 and result.kv_type_k == "f16"
+    assert result.kv_gib == round((12288 + 301.5) / 1024, 2)
+
+
+def test_dense_model_has_no_recurrent_state():
+    model = _model()
+    assert model.recurrent_state_bytes == 0
+    result = fit_runtime_knobs(model, vram_gib=96, slots=6,
+                               per_slot_cap=65536)
+    # 32 attention layers × 4 KV heads × 512 dims × 2 bytes × 393216 tokens
+    assert result.kv_gib == 48.0
