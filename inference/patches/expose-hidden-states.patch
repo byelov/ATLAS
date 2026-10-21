@@ -1,5 +1,5 @@
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index 4b28033..b7a7a9d 100644
+index 637f8d2..ff048a4 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
 @@ -18,11 +18,16 @@
@@ -19,7 +19,7 @@ index 4b28033..b7a7a9d 100644
  // fix problem with std::min and std::max
  #if defined(_WIN32)
  #define WIN32_LEAN_AND_MEAN
-@@ -36,6 +41,57 @@ using json = nlohmann::ordered_json;
+@@ -36,6 +41,61 @@ using json = nlohmann::ordered_json;
  
  constexpr int HTTP_POLLING_SECONDS = 1;
  
@@ -43,21 +43,25 @@ index 4b28033..b7a7a9d 100644
 +};
 +
 +// cb_eval callback installed at server init. Called for each ggml node during decode.
-+// Two-phase: ask=true asks whether to materialize data, ask=false delivers it.
-+// Always returns true (returning false would abort graph compute).
++// Two-phase: ask=true asks whether the caller wants to observe this node,
++// ask=false delivers it. Every "yes" to ask makes the scheduler stop, compute
++// up to that node and synchronize the device, so answer yes only for the
++// requested l_out-{N} nodes: a yes for every node serializes the whole graph
++// (one GPU sync per op) and costs most of the decode speed. ask=false always
++// returns true; false would abort graph compute.
 +static bool atlas_capture_cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
 +    auto * cap = static_cast<atlas_hidden_states_capture *>(user_data);
 +    if (cap == nullptr || cap->layers_wanted.empty()) {
-+        return true;  // not capturing this batch — let compute proceed
++        return !ask;  // not capturing this batch
 +    }
 +    // Match "l_out-{N}" (post-block residual; verified against Qwen3.5-9B GGUF
 +    // — both attention and DeltaNet blocks produce this name).
 +    if (std::strncmp(t->name, "l_out-", 6) != 0) {
-+        return true;
++        return !ask;
 +    }
 +    const int layer_idx = std::atoi(t->name + 6);
 +    if (cap->layers_wanted.find(layer_idx) == cap->layers_wanted.end()) {
-+        return true;
++        return !ask;
 +    }
 +    if (ask) {
 +        return true;  // yes, materialize this tensor's data
@@ -77,7 +81,7 @@ index 4b28033..b7a7a9d 100644
  static void server_prompt_checkpoint_update(server_prompt_checkpoint & ckpt, llama_context * ctx, int id, int64_t n_tokens, bool on_device, llama_pos pos_min = -1, llama_pos pos_max = -1) {
      if (pos_min == -1) {
          pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx), id);
-@@ -705,6 +761,10 @@ private:
+@@ -705,6 +765,10 @@ private:
  
      bool sleeping = false;
  
@@ -88,7 +92,7 @@ index 4b28033..b7a7a9d 100644
      void destroy() {
          llama_init.reset();
  
-@@ -757,6 +817,12 @@ private:
+@@ -757,6 +821,12 @@ private:
  
          params_base = params;
  
@@ -101,7 +105,7 @@ index 4b28033..b7a7a9d 100644
          llama_init = common_init_from_params(params_base);
  
          model = llama_init->model();
-@@ -1714,6 +1780,32 @@ private:
+@@ -1720,6 +1790,32 @@ private:
              res->embedding.emplace_back(embd, embd + n_embd_out);
          }
  
@@ -134,7 +138,7 @@ index 4b28033..b7a7a9d 100644
          SLT_DBG(slot, "%s", "sending embeddings\n");
  
          queue_results.send(std::move(res));
-@@ -2799,6 +2891,25 @@ private:
+@@ -2805,6 +2901,25 @@ private:
                  batch.logits   + i,
              };
  
@@ -160,7 +164,7 @@ index 4b28033..b7a7a9d 100644
              const int ret = llama_decode(ctx, batch_view);
  
              metrics.on_decoded(slots);
-@@ -4309,6 +4420,50 @@ std::unique_ptr<server_res_generator> server_routes::handle_embeddings_impl(cons
+@@ -4320,6 +4435,50 @@ std::unique_ptr<server_res_generator> server_routes::handle_embeddings_impl(cons
          }
      }
  
@@ -211,7 +215,7 @@ index 4b28033..b7a7a9d 100644
      // create and queue the task
      json responses = json::array();
      auto & rd = res->rd;
-@@ -4324,6 +4479,9 @@ std::unique_ptr<server_res_generator> server_routes::handle_embeddings_impl(cons
+@@ -4335,6 +4494,9 @@ std::unique_ptr<server_res_generator> server_routes::handle_embeddings_impl(cons
              task.params.res_type = res_type;
              task.params.embd_normalize = embd_normalize;
  

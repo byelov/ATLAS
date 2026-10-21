@@ -208,15 +208,17 @@ LLAMA_CPP_REV=$(extract_llama_rev)
 green "  Pinned SHA: $LLAMA_CPP_REV"
 
 # Decide whether we need to (re)build. We avoid rebuilding when the
-# existing binary's stored SHA matches the current pin AND --rebuild
-# wasn't requested.
+# existing binary was built from the current pin AND the current patch,
+# and --rebuild wasn't requested. (A patch fix with an unchanged pin must
+# still reach installed binaries.)
 NEED_BUILD=1
 SHA_MARKER="$LLAMA_BIN_DIR/.llama_cpp_rev"
+BUILD_ID="$LLAMA_CPP_REV patch:$(shasum -a 256 "$PATCH_DIR/expose-hidden-states.patch" | cut -c1-16)"
 if [[ -x "$LLAMA_SERVER" && -f "$SHA_MARKER" && $REBUILD -eq 0 ]]; then
   PREV_REV=$(cat "$SHA_MARKER")
-  if [[ "$PREV_REV" == "$LLAMA_CPP_REV" ]]; then
+  if [[ "$PREV_REV" == "$BUILD_ID" ]]; then
     NEED_BUILD=0
-    green "  Existing build is up-to-date (SHA matches). Skipping rebuild."
+    green "  Existing build is up-to-date (SHA and patch match). Skipping rebuild."
     yellow "  Pass --rebuild to force a fresh compile."
   fi
 fi
@@ -305,7 +307,7 @@ if [[ $NEED_BUILD -eq 1 ]]; then
   chmod 0755 "$INSTALL_STAGE/llama-server-metal" \
              "$INSTALL_STAGE/llama-cli-metal" \
              "$INSTALL_STAGE/llama-cvector-generator-metal"
-  printf '%s\n' "$LLAMA_CPP_REV" > "$INSTALL_STAGE/.llama_cpp_rev"
+  printf '%s\n' "$BUILD_ID" > "$INSTALL_STAGE/.llama_cpp_rev"
 
   for name in "${install_names[@]}"; do
     if [[ -e "$LLAMA_BIN_DIR/$name" ]]; then

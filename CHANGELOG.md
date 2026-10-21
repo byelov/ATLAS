@@ -16,6 +16,10 @@
 
 - The native wrapper refuses to start the sandbox if its Seatbelt profile hides the service token (the executor would otherwise run without auth). The profile names `file-read-data` in its secrets and token rules: Seatbelt lets an operation-specific rule beat a `file-read*` rule regardless of order, so a checkout under the home directory hid the token, and a project that is the checkout itself could read `secrets/`.
 
+### Fixed: the hidden-states patch serialized every decode (all backends)
+- `inference/patches/expose-hidden-states.patch` installs a ggml eval callback that answered "yes, observe this node" to the scheduler for every node, even with no capture requested. The scheduler then computes the graph one node at a time with a device sync after each. It now answers yes only for the requested `l_out-N` layers. Qwen3.5-9B-Q6_K on an M1 Ultra: 1.9 → 50 tok/s generation, 30 → 290 tok/s prompt; captured hidden states are bit-identical. CUDA, ROCm and Vulkan images apply the same patch.
+- `atlas-setup-macos.sh` records the patch hash next to the pinned SHA, so a patch change rebuilds the native llama-server without `--rebuild`.
+
 ### Fixed: `atlas doctor` reported auth enforced while the sandbox ran open
 - `internal_auth` probed only the proxy. It now also sends the sandbox an empty `/syntax-check` with a wrong token (nothing executes either way) and fails if that isn't a 401. An executor that can't read `secrets/service-token` starts with auth off.
 
