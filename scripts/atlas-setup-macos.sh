@@ -497,9 +497,15 @@ if [[ $NATIVE -eq 1 ]]; then
   # Toolchains the sandbox verifies with. Not installed automatically —
   # report what's missing so the operator decides.
   missing_tools=()
-  for t in node go rustc javac ruby php; do
+  for t in node go rustc ruby php; do
     command -v "$t" >/dev/null 2>&1 || missing_tools+=("$t")
   done
+  # /usr/bin/javac always exists (Apple's stub); what matters is a JDK the
+  # sandbox wrapper can use: the openjdk keg or one java_home knows about.
+  if [[ ! -x "$(brew --prefix)/opt/openjdk/bin/javac" ]] &&
+     ! /usr/libexec/java_home >/dev/null 2>&1; then
+    missing_tools+=(javac)
+  fi
   if command -v node >/dev/null 2>&1 && ! node --version >/dev/null 2>&1; then
     yellow "  node is installed but does not run — try: brew reinstall node"
   fi

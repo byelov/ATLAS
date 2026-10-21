@@ -405,8 +405,11 @@ def _truthy(value: Optional[str]) -> bool:
 def _cmd_render_profile(args: argparse.Namespace) -> int:
     home = _home()
     extra = []
-    for p in (os.path.join(home, ".rustup"), os.path.join(home, ".cargo",
-                                                           "bin")):
+    # Toolchains installed into the real home: rustup, and JDKs that IDEs
+    # put in ~/Library/Java (where Apple's /usr/bin/java stub looks).
+    for p in (os.path.join(home, ".rustup"),
+              os.path.join(home, ".cargo", "bin"),
+              os.path.join(home, "Library", "Java", "JavaVirtualMachines")):
         if os.path.isdir(p):
             extra.append(p)
     cfg = SeatbeltConfig(

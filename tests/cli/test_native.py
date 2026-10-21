@@ -329,6 +329,18 @@ def test_wrapper_sandbox_runs_under_seatbelt_on_the_host_port(tmp_path):
     assert profile.read_text().startswith("(version 1)")
 
 
+def test_wrapper_sandbox_uses_the_configured_jdk_after_the_tools_venv(
+        tmp_path):
+    env, _ = _wrapper_env(tmp_path)
+    jdk = tmp_path / "jdk"
+    env["ATLAS_SANDBOX_JAVA_HOME"] = str(jdk)
+    out = _dry_run("sandbox", env)
+    assert out["env"]["JAVA_HOME"] == str(jdk)
+    path = out["env"]["PATH"].split(":")
+    assert path[0].endswith("/home/.venv/bin")
+    assert path.index(str(jdk / "bin")) < path.index("/usr/bin")
+
+
 def test_wrapper_services_bind_loopback(tmp_path):
     env, _ = _wrapper_env(tmp_path)
     assert _dry_run("v3-service", env)["env"]["ATLAS_V3_HOST"] == "127.0.0.1"
@@ -387,6 +399,30 @@ def test_render_profile_command_writes_profile(tmp_path):
     assert rc == 0
     text = out.read_text()
     assert '(remote ip "*:*")' in text
+
+
+def test_render_profile_exposes_user_jdks_read_only(tmp_path, monkeypatch):
+    # Apple's /usr/bin/java stub resolves JDKs under ~/Library/Java; with
+    # the home hidden, `javac` in the sandbox found no Java Runtime.
+    home = tmp_path / "home"
+    jvms = home / "Library" / "Java" / "JavaVirtualMachines"
+    jvms.mkdir(parents=True)
+    monkeypatch.setattr(native, "_home", lambda: str(home))
+    cfg = _cfg(tmp_path)
+    out = tmp_path / "out.sb"
+    assert native.main([
+        "render-profile", "--out", str(out), "--project", cfg.project,
+        "--sandbox-home", cfg.sandbox_home, "--sandbox-tmp", cfg.sandbox_tmp,
+        "--venv", cfg.venv, "--secrets", cfg.secrets,
+        "--atlas-root", cfg.atlas_root, "--prefix", cfg.prefix]) == 0
+    text = out.read_text()
+    jvms_rule = f'(subpath "{os.path.realpath(jvms)}")'
+    reads = next(line for line in text.splitlines()
+                 if line.startswith("(allow file-read-data"))
+    assert jvms_rule in reads
+    writes = next(line for line in text.splitlines()
+                  if line.startswith("(allow file-write*"))
+    assert jvms_rule not in writes
 
 
 def test_native_commands_refuse_off_macos(monkeypatch, capsys):

@@ -251,8 +251,21 @@ case "$SERVICE" in
     [[ -x "$tools_venv/bin/python" ]] || \
       die "missing $tools_venv — run ./scripts/atlas-setup-macos.sh --native"
 
-    sbx_path="$tools_venv/bin:$sbx_home/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+    # Homebrew's openjdk is keg-only, so `javac` on PATH is Apple's stub,
+    # which only finds JDKs registered under /Library/Java or ~/Library/Java.
+    java_home="${ATLAS_SANDBOX_JAVA_HOME:-}"
+    if [[ -z "$java_home" ]]; then
+      for jdk in /opt/homebrew/opt/openjdk/libexec/openjdk.jdk/Contents/Home \
+                 /usr/local/opt/openjdk/libexec/openjdk.jdk/Contents/Home; do
+        if [[ -x "$jdk/bin/javac" ]]; then java_home="$jdk"; break; fi
+      done
+    fi
+
+    sbx_path="$tools_venv/bin:$sbx_home/.local/bin:${java_home:+$java_home/bin:}/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
     extra_env=()
+    if [[ -n "$java_home" ]]; then
+      extra_env+=(JAVA_HOME="$java_home")
+    fi
     # rustup keeps its toolchains in the real home; expose them read-only.
     if [[ -d "$HOME/.rustup" && -d "$HOME/.cargo/bin" ]]; then
       sbx_path="$sbx_path:$HOME/.cargo/bin"

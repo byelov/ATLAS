@@ -31,7 +31,10 @@ and `atlas doctor` work the same way on both paths.
 
 Toolchains used to verify generated code are optional. The setup script lists the
 ones it can't find: `node`, `go`, `rustc` (rustup), `javac` (openjdk), `ruby`,
-`php`.
+`php`. Homebrew's `openjdk` is keg-only; the sandbox puts its JDK on PATH as
+`JAVA_HOME` (`ATLAS_SANDBOX_JAVA_HOME` in `.env` picks another), and JDKs
+installed under `~/Library/Java/JavaVirtualMachines` are readable inside the
+sandbox.
 
 ## Install — TL;DR
 

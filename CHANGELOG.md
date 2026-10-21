@@ -14,6 +14,7 @@
 - The lens reads its artifact directory from `ATLAS_LENS_MODELS_DIR` when set (the native wrapper passes `ATLAS_LENS_MODELS`; compose still bind-mounts it). `atlas init --deploy native` gives the model a Lens bundle directory of its own, `./models/lens/<model>`.
 - Docs: [SETUP_MACOS_NATIVE.md](docs/SETUP_MACOS_NATIVE.md).
 
+- Java works in the native sandbox. Homebrew's `openjdk` is keg-only, so `javac` on PATH is Apple's stub, which looks for JDKs in `/Library/Java` and `~/Library/Java`, and the profile hid the latter. The wrapper puts the keg's JDK (or `ATLAS_SANDBOX_JAVA_HOME`) on PATH as `JAVA_HOME`, the profile makes `~/Library/Java/JavaVirtualMachines` readable, and setup counts `javac` as present only when a real JDK exists.
 - The native wrapper refuses to start the sandbox if its Seatbelt profile hides the service token (the executor would otherwise run without auth). The profile names `file-read-data` in its secrets and token rules: Seatbelt lets an operation-specific rule beat a `file-read*` rule regardless of order, so a checkout under the home directory hid the token, and a project that is the checkout itself could read `secrets/`.
 
 ### Fixed: the hidden-states patch serialized every decode (all backends)

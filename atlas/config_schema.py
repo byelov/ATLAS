@@ -125,6 +125,7 @@ SCHEMA: Dict[str, Field] = {
     "ATLAS_PROXY_HOST": Field("str"),
     "ATLAS_V3_HOST": Field("str"),
     "ATLAS_SANDBOX_HOST": Field("str"),
+    "ATLAS_SANDBOX_JAVA_HOME": Field("str"),
     # Written by `atlas init` (wizard-detected GPU vendor + host UID/GID
     # for the proxy container); validate() must not flag its own output.
     "ATLAS_GPU_VENDOR": Field("str"),
