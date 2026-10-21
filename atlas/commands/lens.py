@@ -38,6 +38,7 @@ import os
 import sys
 import tempfile
 import time
+from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass, asdict
 from typing import Dict, List, Optional
 
@@ -430,8 +431,11 @@ def _embed_text(llama_url: str, text: str,
     mean-pools per-token states anyway, so chunk-averaging is the same
     operation at coarser granularity). Depth-capped at 4 (16 chunks).
     """
+    # Explicit L2 normalization, like the lens service requests under a
+    # normalized embedding_contract: server defaults vary across revisions.
     resp = post_json_or_none(f"{llama_url}/embedding",
-                             {"content": text}, timeout=60.0)
+                             {"content": text, "embd_normalize": 2},
+                             timeout=60.0)
     vec = None
     if isinstance(resp, list) and resp and isinstance(resp[0], dict):
         raw = resp[0].get("embedding")
@@ -463,8 +467,39 @@ def _embed_text(llama_url: str, text: str,
         # that hit this path, any chunk is representative.
         return (va or vb), (pa or pb)
     wa, wb = len(left), len(right)
-    return ([(a * wa + b * wb) / (wa + wb) for a, b in zip(va, vb)],
-            pa + pb)
+    vec = [(a * wa + b * wb) / (wa + wb) for a, b in zip(va, vb)]
+    # An average of unit vectors is shorter than unit length; keep pooled
+    # samples on the scale the server returns for a single piece.
+    norm_a = sum(x * x for x in va) ** 0.5
+    norm = sum(x * x for x in vec) ** 0.5
+    if abs(norm_a - 1.0) < 0.05 and norm > 0:
+        vec = [x / norm for x in vec]
+    return vec, pa + pb
+
+
+def _probe_embedding_contract(llama_url: str) -> Optional[Dict]:
+    """The embedding convention the server returned for the training
+    samples, recorded in model_identity.json so the lens service enforces
+    it at scoring time (a pooling or normalization change would otherwise
+    shift every score silently). None when the server can't be probed."""
+    resp = post_json_or_none(f"{llama_url}/embedding",
+                             {"content": "def f(x):\n    return x\n",
+                              "embd_normalize": 2}, timeout=60.0)
+    if not (isinstance(resp, list) and resp and isinstance(resp[0], dict)):
+        return None
+    raw = resp[0].get("embedding")
+    if not (isinstance(raw, list) and raw):
+        return None
+    if isinstance(raw[0], list):
+        if len(raw) > 1:
+            # Per-token states (a server without --pooling mean): the build
+            # and the service pool those differently, so don't vouch for a
+            # convention.
+            return None
+        raw = raw[0]  # a pooled vector, as one nested row
+    norm = sum(x * x for x in raw) ** 0.5
+    return {"pooling": "mean", "response_shape": "flat",
+            "normalized": abs(norm - 1.0) < 0.05}
 
 
 def _extract_training_embeddings(samples: List[Dict],
@@ -768,6 +803,35 @@ def _load_collected_samples(model_name: Optional[str]) -> List[Dict]:
     return samples
 
 
+def _gx_train_and_save(data: Dict, gl_dir: str, save_dir: str) -> Dict:
+    """Child-process half of _train_gx_isolated."""
+    if gl_dir not in sys.path:
+        sys.path.insert(0, gl_dir)
+    from geometric_lens.training import train_gx, save_gx
+    result = train_gx(data)
+    save_gx(result, save_dir=save_dir)
+    sys.stdout.flush()
+    return {"cv_auc_mean": result["cv_auc_mean"]}
+
+
+def _train_gx_isolated(data: Dict, gl_dir: str, save_dir: str) -> Dict:
+    """Train G(x) and write it to `save_dir` in a fresh interpreter.
+
+    torch (C(x), trained just before) and XGBoost / scikit-learn each ship
+    their own OpenMP runtime on macOS. Once torch's thread pool exists, a
+    second runtime's parallel region can crash the process (SIGSEGV in
+    libomp's worker threads). A spawned child never loads torch. A child
+    that dies raises BrokenProcessPool instead of hanging the build.
+    """
+    import multiprocessing
+    from concurrent.futures import ProcessPoolExecutor
+    with ProcessPoolExecutor(
+            max_workers=1,
+            mp_context=multiprocessing.get_context("spawn")) as pool:
+        return pool.submit(_gx_train_and_save, data, gl_dir,
+                           save_dir).result()
+
+
 def _emit_build(args: argparse.Namespace, color: bool) -> int:
     """Train fresh Lens artifacts for the model llama-server has loaded.
 
@@ -910,16 +974,31 @@ def _emit_build(args: argparse.Namespace, color: bool) -> int:
                 # of any kept vector is the same sample; genuinely
                 # different candidates differ by orders of magnitude more.
                 kept = np.array(data["embeddings"], dtype=np.float32)
-                merged = dups = 0
+                # Banked vectors carry whatever normalization the server
+                # defaulted to when the bench ran (older llama.cpp returned
+                # raw pooled vectors, ‖v‖ ≈ 64), while the extracted set
+                # follows the lens contract (L2-normalized). Bring them to
+                # the extracted convention: mixed scales let magnitude
+                # stand in for the sample's source, and defeat the dedup.
+                unit = bool(np.all(
+                    np.abs(np.linalg.norm(kept, axis=1) - 1.0) < 0.05))
+                merged = dups = rescaled = 0
                 for rec in tele:
                     v = np.array(rec["embedding"], dtype=np.float32)
+                    norm = float(np.linalg.norm(v))
+                    if unit and norm > 0 and abs(norm - 1.0) >= 0.05:
+                        v = v / norm
+                        rescaled += 1
                     if np.abs(kept - v).max(axis=1).min() < 1e-3:
                         dups += 1
                         continue
                     kept = np.vstack([kept, v])
-                    data["embeddings"].append(rec["embedding"])
+                    data["embeddings"].append(v.tolist())
                     data["labels"].append(rec["label"])
                     merged += 1
+                if rescaled:
+                    _safe_print(f"  L2-normalized {rescaled} banked "
+                                f"embedding(s) to match the extracted set")
                 _safe_print(f"  Merged {merged} banked candidate embeddings "
                             f"from {os.path.basename(emb_path)} "
                             f"({dups} duplicates of extracted samples"
@@ -1000,8 +1079,13 @@ def _emit_build(args: argparse.Namespace, color: bool) -> int:
         # live directory unless both halves and their metadata are complete.
         _safe_print("[5/5] Training G(x) XGBoost…")
         try:
-            from geometric_lens.training import train_gx, save_gx
-            gx_result = train_gx(data)
+            gx_result = _train_gx_isolated(data, gl_dir, staging_dir)
+        except BrokenProcessPool:
+            _safe_print(f"  {RED if color else ''}The G(x) trainer process "
+                        f"crashed.{RESET if color else ''}")
+            _safe_print("  The previous live bundle is unchanged; embeddings "
+                        "are cached for a quick retry.")
+            return 1
         except ImportError as e:
             _safe_print(f"  {RED if color else ''}Could not import the G(x) "
                         f"trainer: {e}.{RESET if color else ''}")
@@ -1017,16 +1101,17 @@ def _emit_build(args: argparse.Namespace, color: bool) -> int:
             _safe_print("  The previous live bundle is unchanged. Add more "
                         "bench samples and re-run.")
             return 1
-        save_gx(gx_result, save_dir=staging_dir)
         from geometric_lens.identity import save_model_identity
-        model_identity = (args.model or verdict.probe.model_name or "").strip()
+        model_identity = publishing.model_marker_value(
+            args.model or verdict.probe.model_name or "")
         if not model_identity:
             _safe_print(f"  {RED if color else ''}Could not identify the loaded "
                         f"model; refusing to activate these artifacts."
                         f"{RESET if color else ''}")
             return 1
         save_model_identity(
-            staging_dir, model_identity, verdict.probe.embedding_dim)
+            staging_dir, model_identity, verdict.probe.embedding_dim,
+            _probe_embedding_contract(verdict.probe.url))
         # Per-bundle provenance manifest (SUPPORT_MATRIX §9.5): every
         # activated bundle is reproducible and auditable — `atlas artifact
         # verify/snapshot/rollback` consume this file. Best-effort: a

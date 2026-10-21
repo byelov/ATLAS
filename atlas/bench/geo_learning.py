@@ -26,7 +26,10 @@ def extract_embedding_urllib(text: str, llama_url: str) -> Optional[List[float]]
     Returns:
         List of floats, or None on failure.
     """
-    body = json.dumps({"content": text}).encode("utf-8")
+    # Ask for L2 normalization explicitly, like the lens service does:
+    # server defaults vary across llama.cpp revisions, and the vectors
+    # banked here train `atlas lens build`, whose artifacts expect it.
+    body = json.dumps({"content": text, "embd_normalize": 2}).encode("utf-8")
     endpoint = f"{llama_url}/embedding"
 
     req = urllib.request.Request(

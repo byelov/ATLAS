@@ -308,12 +308,16 @@ def train_gx(
     pca = PCA(n_components=k, random_state=seed)
     Xp = pca.fit_transform(X).astype(np.float32)
 
+    # Single-threaded xgboost (params and every DMatrix): with torch loaded,
+    # xgboost's OpenMP workers segfault on macOS. See the nthread note in
+    # service._load_gx_models.
     params = {
         "objective": "binary:logistic",
         "max_depth": max_depth,
         "eta": learning_rate,
         "eval_metric": "auc",
         "seed": seed,
+        "nthread": 1,
     }
 
     folds = min(n_folds, n_pass, n_fail)
@@ -324,8 +328,9 @@ def train_gx(
     oof_scores = np.full(n, np.nan, dtype=np.float64)
     skf = StratifiedKFold(n_splits=folds, shuffle=True, random_state=seed)
     for fold, (tr, te) in enumerate(skf.split(Xp, y)):
-        dtr = xgb.DMatrix(Xp[tr], label=y[tr], weight=(w[tr] if w is not None else None))
-        dte = xgb.DMatrix(Xp[te], label=y[te])
+        dtr = xgb.DMatrix(Xp[tr], label=y[tr], weight=(w[tr] if w is not None else None),
+                          nthread=1)
+        dte = xgb.DMatrix(Xp[te], label=y[te], nthread=1)
         bst = xgb.train(params, dtr, num_boost_round=max_rounds,
                         evals=[(dte, "val")], early_stopping_rounds=30,
                         verbose_eval=False)
@@ -339,7 +344,7 @@ def train_gx(
 
     # Final model on the full set, sized by the folds' early stopping.
     rounds = int(np.median(best_rounds))
-    dall = xgb.DMatrix(Xp, label=y, weight=w)
+    dall = xgb.DMatrix(Xp, label=y, weight=w, nthread=1)
     booster = xgb.train(params, dall, num_boost_round=rounds)
 
     scores = booster.predict(dall)

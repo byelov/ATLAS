@@ -267,11 +267,13 @@ This is Homebrew Python's PEP 668 enforcement — `pip install` and `pip install
    brew install pipx
    pipx ensurepath
    cd ~/ATLAS
-   pipx install --force --editable .
+   pipx install --force --python "$(brew --prefix python@3.12)/bin/python3.12" --editable .
    source ~/.zprofile     # reload PATH
    ```
 
 Either path puts the `atlas` binary in `~/.local/bin/` with its dependencies isolated in a pipx-managed venv. `git pull` upgrades atlas in place because we used `--editable`.
+
+The `--python` pin matters for `atlas lens build` / `atlas asa build`: they need the `atlas[train]` extra (torch), and a brand-new Homebrew Python can be ahead of torch's wheels. If `pipx inject atlas torch` fails with `no wheels with a matching Python ABI tag`, reinstall with the pin above.
 
 ### Setup script fails at `hidden-states patch does not apply`
 

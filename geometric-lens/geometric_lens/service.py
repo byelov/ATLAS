@@ -264,7 +264,9 @@ class _BoosterClassifier:
     def predict_proba(self, x):
         import numpy as np
         import xgboost as xgb
-        dmatrix = xgb.DMatrix(np.asarray(x, dtype=np.float32))
+        # nthread=1: see _load_gx_models — xgboost's OpenMP pool segfaults
+        # alongside torch's on macOS.
+        dmatrix = xgb.DMatrix(np.asarray(x, dtype=np.float32), nthread=1)
         pos = self._booster.predict(dmatrix)
         return np.column_stack([1.0 - pos, pos])
 
@@ -298,8 +300,17 @@ def _load_gx_models(models_dir: str) -> None:
             import xgboost as xgb
 
             if os.path.exists(xgb_json):
-                booster = xgb.Booster()
-                booster.load_model(xgb_json)
+                # Single-threaded on purpose. On macOS pip wheels, xgboost
+                # uses Homebrew's libomp while torch ships its own; dyld binds
+                # libomp's weak symbols to whichever copy loaded first, so
+                # xgboost worker threads that go idle call into torch's
+                # runtime and SIGSEGV in __kmp_suspend_initialize_thread.
+                # With nthread=1 xgboost never starts OpenMP workers. Booster
+                # params only apply from the first predict; load_model itself
+                # runs in parallel, so it also needs the global config_context.
+                with xgb.config_context(nthread=1):
+                    booster = xgb.Booster(params={"nthread": 1})
+                    booster.load_model(xgb_json)
                 _gx_xgboost = _BoosterClassifier(booster)
                 load_path = "json"
             elif os.environ.get("ATLAS_ALLOW_PICKLE_GX") == "1":
@@ -308,8 +319,10 @@ def _load_gx_models(models_dir: str) -> None:
                 # artifacts. Users on the old format set
                 # ATLAS_ALLOW_PICKLE_GX=1 once to load it, then re-export.
                 import pickle
-                with open(xgb_pkl, 'rb') as f:
+                with open(xgb_pkl, 'rb') as f, xgb.config_context(nthread=1):
                     _gx_xgboost = pickle.load(f)
+                if hasattr(_gx_xgboost, "set_params"):
+                    _gx_xgboost.set_params(n_jobs=1)  # see nthread note above
                 load_path = "pickle (deprecated — re-export to gx_xgboost.json)"
             else:
                 logger.warning(

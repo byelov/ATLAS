@@ -195,6 +195,13 @@ case "$SERVICE" in
       GEOMETRIC_LENS_ENABLED=true
       SQLITE_DB_PATH="$STATE/lens/geometric_state.db"
       PYTHONDONTWRITEBYTECODE=1
+      # torch and xgboost each bundle an OpenMP runtime on macOS (the Linux
+      # images share libgomp). Once a calibrated G(x) is loaded both live
+      # in this process and libomp aborts at startup ("OMP: Error #15").
+      # The lens scores one vector at a time, so run single-threaded,
+      # which keeps the two runtimes from ever running worker threads.
+      KMP_DUPLICATE_LIB_OK=TRUE
+      OMP_NUM_THREADS=1
       ${token_env[@]+"${token_env[@]}"}
     )
     deps=("$LLAMA_URL")

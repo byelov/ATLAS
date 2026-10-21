@@ -335,6 +335,9 @@ def test_wrapper_services_bind_loopback(tmp_path):
     lens = _dry_run("geometric-lens", env)
     assert "--host 127.0.0.1 --port 8099" in lens["cmd"]
     assert lens["env"]["LLAMA_URL"] == "http://127.0.0.1:8080"
+    # torch + xgboost (calibrated G(x)) share the process on macOS.
+    assert lens["env"]["KMP_DUPLICATE_LIB_OK"] == "TRUE"
+    assert lens["env"]["OMP_NUM_THREADS"] == "1"
     # No bind mount natively: compose's default lens dir, passed by env.
     assert lens["env"]["ATLAS_LENS_MODELS_DIR"] == str(
         ROOT / "geometric-lens" / "geometric_lens" / "models")

@@ -11,6 +11,7 @@ Coverage strategy:
 """
 
 import json
+import pathlib
 
 import pytest
 
@@ -415,6 +416,122 @@ def test_build_compat_with_no_force_is_noop(monkeypatch, tmp_path, capsys):
     out = capsys.readouterr().out
     assert rc == 0
     assert "--force" in out
+
+
+def test_build_normalizes_banked_telemetry_to_the_extracted_scale(
+        monkeypatch, tmp_path, capsys):
+    """Bench telemetry banked raw (‖v‖ ≈ 64, older llama.cpp's default)
+    must join the L2-normalized extracted set at unit scale: one banked
+    vector is a scaled copy of an extracted sample (a duplicate), the other
+    is new. Comparing raw values merged both, at 64× the scale."""
+    np = pytest.importorskip("numpy")
+    monkeypatch.syspath_prepend(str(
+        pathlib.Path(lens.__file__).resolve().parents[2] / "v3-service"))
+    from stages.embedding_store import EmbeddingWriter
+
+    per_task = tmp_path / "run" / "v3_lcb" / "per_task"
+    per_task.mkdir(parents=True)
+    for i in range(60):
+        (per_task / f"t{i}.json").write_text(json.dumps(
+            {"code": f"print({i})", "passed": i % 2 == 0}))
+    rng = np.random.default_rng(0)
+    unit = rng.normal(size=(60, 8)).astype(np.float32)
+    unit /= np.linalg.norm(unit, axis=1, keepdims=True)
+    monkeypatch.setattr(lens, "_extract_training_embeddings", lambda *a, **kw: {
+        "embeddings": unit.tolist(), "labels": [int(i % 2 == 0) for i in range(60)]})
+    fresh = rng.normal(size=8).astype(np.float32)
+    fresh /= np.linalg.norm(fresh)
+    writer = EmbeddingWriter(tmp_path / "run" / "telemetry" / "embeddings.emb")
+    writer.write("t3", 0, "FAIL", (unit[3] * 64).tolist())
+    writer.write("t9", 1, "PASS", (fresh * 64).tolist())
+    writer.close()
+
+    monkeypatch.setattr(lens, "probe_llama",
+                        lambda *a, **kw: _probe(embedding_dim=8))
+    monkeypatch.setenv("ATLAS_LENS_MODELS", str(tmp_path / "artifacts"))
+    rc = lens.main(["build", "--from-results", str(per_task), "--force",
+                    "--dry-run", "--no-color"])
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    assert "L2-normalized 2 banked" in out
+    assert "Merged 1 banked candidate embeddings" in out
+    assert "(1 duplicates" in out
+
+
+def _fake_gx_trainer(tmp_path, source):
+    pkg = tmp_path / "gl" / "geometric_lens"
+    pkg.mkdir(parents=True)
+    (pkg / "__init__.py").write_text("")
+    (pkg / "training.py").write_text(source)
+    return str(tmp_path / "gl")
+
+
+def test_gx_trains_and_saves_in_a_child_process(tmp_path):
+    # torch's and XGBoost's OpenMP runtimes crash each other in one process
+    # on macOS, so G(x) never runs where C(x) (torch) just trained.
+    import os
+    gl = _fake_gx_trainer(tmp_path, (
+        "import os\n"
+        "def train_gx(data):\n"
+        "    return {'cv_auc_mean': 0.75, 'pid': os.getpid(), 'n': len(data['labels'])}\n"
+        "def save_gx(result, save_dir):\n"
+        "    with open(os.path.join(save_dir, 'saved_by'), 'w') as fh:\n"
+        "        fh.write(f\"{result['pid']} {result['n']}\")\n"))
+    out = lens._train_gx_isolated({"embeddings": [[0.0]] * 3, "labels": [1, 0, 1]},
+                                  gl, str(tmp_path))
+    assert out == {"cv_auc_mean": 0.75}
+    pid, n = (tmp_path / "saved_by").read_text().split()
+    assert int(pid) != os.getpid() and n == "3"
+
+
+def test_gx_child_crash_fails_instead_of_hanging(tmp_path):
+    from concurrent.futures.process import BrokenProcessPool
+    gl = _fake_gx_trainer(tmp_path, (
+        "import os, signal\n"
+        "def train_gx(data):\n"
+        "    os.kill(os.getpid(), signal.SIGSEGV)\n"
+        "def save_gx(result, save_dir):\n"
+        "    pass\n"))
+    with pytest.raises(BrokenProcessPool):
+        lens._train_gx_isolated({"embeddings": [], "labels": []}, gl,
+                                str(tmp_path))
+
+
+def test_build_records_the_embedding_contract_it_trained_under(monkeypatch):
+    calls = []
+
+    def fake_post(url, body, timeout=None):
+        calls.append(body)
+        return [{"embedding": [0.6, 0.8]}]
+    monkeypatch.setattr(lens, "post_json_or_none", fake_post)
+    assert lens._probe_embedding_contract("http://llama") == {
+        "pooling": "mean", "response_shape": "flat", "normalized": True}
+    assert calls[0]["embd_normalize"] == 2
+
+    # llama-server's /embedding wraps a pooled vector as one nested row.
+    monkeypatch.setattr(lens, "post_json_or_none",
+                        lambda *a, **kw: [{"embedding": [[0.6, 0.8]]}])
+    assert lens._probe_embedding_contract("http://llama")["normalized"] is True
+    monkeypatch.setattr(lens, "post_json_or_none",
+                        lambda *a, **kw: [{"embedding": [[0.1, 0.2], [0.3, 0.4]]}])
+    assert lens._probe_embedding_contract("http://llama") is None
+    monkeypatch.setattr(lens, "post_json_or_none", lambda *a, **kw: None)
+    assert lens._probe_embedding_contract("http://llama") is None
+
+
+def test_chunked_embedding_stays_unit_length(monkeypatch):
+    # Inputs longer than the micro-batch are embedded in halves and averaged;
+    # the average of two unit vectors is shorter, which a normalized
+    # contract would reject at scoring time.
+    def fake_post(url, body, timeout=None):
+        if len(body["content"]) > 20:
+            return {"error": "input is too large"}
+        return [{"embedding": [1.0, 0.0] if "a" in body["content"]
+                 else [0.0, 1.0]}]
+    monkeypatch.setattr(lens, "post_json_or_none", fake_post)
+    vec, pieces = lens._embed_text("http://llama", "aaaaaaaaaa\nbbbbbbbbbbbb")
+    assert pieces == 2
+    assert abs(sum(x * x for x in vec) ** 0.5 - 1.0) < 1e-9
 
 
 # ---------------------------------------------------------------------------

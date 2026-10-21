@@ -367,14 +367,25 @@ step "7/$TOTAL" "Installing atlas CLI"
 
 # pipx install --force is idempotent — re-running upgrades in place.
 # --editable so 'git pull' picks up changes without reinstall.
+# --python pins the venv to step 3's python@3.12. Left to itself pipx uses
+# the newest Homebrew Python, which torch (the `atlas[train]` extra that
+# `atlas lens build` / `atlas asa build` need) may not have wheels for yet.
+CLI_PY="$(brew --prefix python@3.12)/bin/python3.12"
 if command -v pipx >/dev/null 2>&1; then
-  (cd "$ATLAS_ROOT" && pipx install --force --editable .)
+  (cd "$ATLAS_ROOT" && pipx install --force --python "$CLI_PY" --editable .)
+  # install --force keeps an existing venv's interpreter; rebuild it on
+  # CLI_PY (reinstall keeps injected packages such as atlas[train]).
+  cli_venv_py="$(pipx environment --value PIPX_LOCAL_VENVS)/atlas/bin/python"
+  py_ver='import sys; print("%d.%d" % sys.version_info[:2])'
+  if [[ "$("$cli_venv_py" -c "$py_ver" 2>/dev/null)" != "$("$CLI_PY" -c "$py_ver")" ]]; then
+    pipx reinstall --python "$CLI_PY" atlas
+  fi
   green "  Installed via pipx (isolated venv, atlas binary on PATH)."
 elif command -v uv >/dev/null 2>&1; then
   # uv tool install is uv's pipx equivalent — also creates an
   # isolated venv. Use --system as a last resort, dodges PEP 668 by
   # uv's own override but pollutes the brew Python environment.
-  (cd "$ATLAS_ROOT" && uv tool install --editable .)
+  (cd "$ATLAS_ROOT" && uv tool install --python "$CLI_PY" --editable .)
   green "  Installed via uv tool install."
 else
   red "neither pipx nor uv found. PEP 668 blocks plain pip on Homebrew Python."
