@@ -46,7 +46,7 @@ COPY patches/ /patches/
 # Pin llama.cpp to a known-good SHA (same rationale as Dockerfile.v31 —
 # upstream context drift breaks the PC-202 patch periodically). Keep
 # this aligned with the other Dockerfiles.
-ARG LLAMA_CPP_REV=2e97c5f96f9fe2bb26f794a348e05d7a1c74baa1
+ARG LLAMA_CPP_REV=479a52779ff4c4674b81a226f8511816e15dc8dd
 # #117: Split fetch -> patch -> build into three RUN layers so a
 # LLAMA_CPP_REV bump or a patches/ change invalidates only the affected
 # layer. ccache mount (below) further mitigates SHA bumps by caching
@@ -68,8 +68,8 @@ RUN git init /llama.cpp && \
 RUN cd /llama.cpp && \
     sed -i '/auto params_dft = params_base;/a\        params_dft.embedding = false;  // ATLAS: draft never needs embeddings' \
         tools/server/server-context.cpp 2>/dev/null || true && \
-    git apply --check /patches/expose-hidden-states.patch && \
-    git apply         /patches/expose-hidden-states.patch
+    git apply --check /patches/expose-hidden-states.patch /patches/fix-pooled-reserve.patch && \
+    git apply         /patches/expose-hidden-states.patch /patches/fix-pooled-reserve.patch
 
 # 3. Build with HIP/ROCm + ccache mount (#117).
 #    GGML_HIP=ON enables the AMD backend (was GGML_HIPBLAS in older).

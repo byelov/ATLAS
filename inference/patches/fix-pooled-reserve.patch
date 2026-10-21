@@ -1,0 +1,29 @@
+ATLAS: upstream llama.cpp bug fix (applied with `git apply`, which skips this text).
+
+graph_reserve() rounds n_tokens up to a multiple of n_seqs but kept
+n_outputs as requested. A context with --embeddings --pooling mean
+reserves with n_outputs == n_tokens, so with --parallel N where N does
+not divide the ubatch size (ATLAS: 6 slots, -ub 2048) mean pooling
+multiplied an n_outputs-row matrix by an n_tokens-wide mask and
+llama-server aborted at startup:
+  GGML_ASSERT(ggml_can_mul_mat(a, b)) failed  (llm_graph_context::build_pooling)
+Keep "every token is an output" true after the rounding.
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 9ee64b5..9aad057 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -2624,7 +2624,13 @@ ggml_cgraph * llama_context::graph_reserve(
+     GGML_ASSERT(n_outputs >= 1);
+ 
+     if (n_tokens % n_seqs != 0) {
++        const uint32_t n_tokens_req = n_tokens;
+         n_tokens = ((n_tokens + (n_seqs - 1)) / n_seqs) * n_seqs; // round to next multiple of n_seqs
++        // ATLAS: a graph that outputs every token (pooled embeddings) must keep doing so,
++        // otherwise mean pooling multiplies n_outputs rows by an n_tokens-wide mask and aborts
++        if (n_outputs == n_tokens_req) {
++            n_outputs = n_tokens;
++        }
+         LLAMA_LOG_DEBUG("%s: making n_tokens a multiple of n_seqs - n_tokens = %u, n_seqs = %u, n_outputs = %u\n", __func__, n_tokens, n_seqs, n_outputs);
+     }
+ 

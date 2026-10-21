@@ -64,7 +64,7 @@ COPY patches/ /patches/
 #   1. There's a llama.cpp release with a feature/fix we want
 #   2. The PC-202 patch has been regenerated against the new upstream
 # Override at build time: --build-arg LLAMA_CPP_REV=<sha>
-ARG LLAMA_CPP_REV=2e97c5f96f9fe2bb26f794a348e05d7a1c74baa1
+ARG LLAMA_CPP_REV=479a52779ff4c4674b81a226f8511816e15dc8dd
 # #117: Split fetch -> patch -> build into three RUN layers so a
 # LLAMA_CPP_REV bump or a patches/ change invalidates only the affected
 # layer + everything below, not the whole giant step. The build is the
@@ -97,11 +97,14 @@ RUN git init /llama.cpp && \
 #      [int]` request param; response gains `hidden_states` (base64
 #      float32 per layer) for PC-203 SAE + PC-207 lens-as-PRM. No-op
 #      when `layers` is omitted. See ISSUES.md PC-202.
+#    - git apply: fix-pooled-reserve.patch, an upstream bug fix — with
+#      --pooling mean, llama-server aborts at startup when --parallel
+#      doesn't divide the ubatch size. See the patch header.
 RUN cd /llama.cpp && \
     sed -i '/auto params_dft = params_base;/a\        params_dft.embedding = false;  // ATLAS: draft never needs embeddings' \
         tools/server/server-context.cpp 2>/dev/null || true && \
-    git apply --check /patches/expose-hidden-states.patch && \
-    git apply         /patches/expose-hidden-states.patch
+    git apply --check /patches/expose-hidden-states.patch /patches/fix-pooled-reserve.patch && \
+    git apply         /patches/expose-hidden-states.patch /patches/fix-pooled-reserve.patch
 
 # 3. Build. The slow one (~5-30min depending on host + GPU arch count).
 #    --mount=type=cache for /root/.ccache persists compiled object

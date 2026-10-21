@@ -1,8 +1,8 @@
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index 637f8d2..ff048a4 100644
+index 296893f..40e83a8 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
-@@ -18,11 +18,16 @@
+@@ -25,13 +25,18 @@
  #include <algorithm>
  #include <cstddef>
  #include <cinttypes>
@@ -11,28 +11,35 @@ index 637f8d2..ff048a4 100644
  #include <exception>
  #include <memory>
  #include <filesystem>
+ #include <random>
 +#include <set>
  #include <utility>
+ #include <fstream>
  
 +#include "ggml-backend.h"
 +
  // fix problem with std::min and std::max
  #if defined(_WIN32)
  #define WIN32_LEAN_AND_MEAN
-@@ -36,6 +41,61 @@ using json = nlohmann::ordered_json;
+@@ -43,6 +48,66 @@
  
  constexpr int HTTP_POLLING_SECONDS = 1;
  
 +// ATLAS PC-202: per-layer residual stream capture for hidden-states extension.
-+// Filled by update_slots() before llama_decode (from the union of hidden_states_layers
-+// across active embedding slots), populated by atlas_capture_cb_eval during decode,
-+// then consumed by send_embedding which slices per-slot tokens out of the captured
-+// flat buffers. Cleared at the end of each update_slots iteration.
++// Filled by decode() before each llama_process (from the union of hidden_states_layers
++// across active embedding slots), populated by atlas_capture_cb_eval during the decode,
++// then consumed by send_embedding, which takes its slot's tokens out of the captured
++// chunks. Reset before every decode.
++//
++// Embedding slots only batch with other embedding slots, so every token of such a
++// batch is an output, and llama.cpp then splits it one sequence per ubatch
++// (split_seq), in the order each sequence first appears in the batch. The callback
++// fires once per ubatch, so each layer gets one chunk per sequence, in that order.
 +struct atlas_hidden_states_capture {
-+    std::set<int>                       layers_wanted;   // union across active slots
-+    std::map<int, std::vector<float>>   captured;        // layer -> flat [hidden_dim * batch_n_tokens]
-+    int32_t                             hidden_dim = 0;
-+    int32_t                             batch_n_tokens = 0;
++    std::set<int>                                  layers_wanted;  // union across active slots
++    std::map<int, std::vector<std::vector<float>>> captured;       // layer -> per-ubatch flat [hidden_dim * n_tokens]
++    int32_t                                        hidden_dim = 0;
++    int32_t                                        batch_n_tokens = 0;
 +
 +    void clear() {
 +        layers_wanted.clear();
@@ -72,16 +79,16 @@ index 637f8d2..ff048a4 100644
 +        return true;  // unexpected dtype; skip rather than corrupt the buffer
 +    }
 +    const size_t n = ggml_nelements(t);
-+    auto & buf = cap->captured[layer_idx];
-+    buf.resize(n);
-+    ggml_backend_tensor_get(t, buf.data(), 0, n * sizeof(float));
++    auto & chunks = cap->captured[layer_idx];
++    chunks.emplace_back(n);
++    ggml_backend_tensor_get(t, chunks.back().data(), 0, n * sizeof(float));
 +    return true;
 +}
 +
- static void server_prompt_checkpoint_update(server_prompt_checkpoint & ckpt, llama_context * ctx, int id, int64_t n_tokens, bool on_device, llama_pos pos_min = -1, llama_pos pos_max = -1) {
-     if (pos_min == -1) {
-         pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx), id);
-@@ -705,6 +765,10 @@ private:
+ static common_speculative_output_limits server_output_limits(const common_params & params) {
+     if (!params.mmproj.path.empty()) {
+         const auto mcaps = mtmd_get_cap_from_file(params.mmproj.path.c_str());
+@@ -1112,6 +1177,10 @@ private:
  
      bool sleeping = false;
  
@@ -89,12 +96,12 @@ index 637f8d2..ff048a4 100644
 +    // Lives for the server's lifetime; cb_eval points at it via user_data.
 +    atlas_hidden_states_capture hidden_states_capture;
 +
+     int64_t t_last_load_progress_ms = 0;
+ 
      void destroy() {
-         llama_init.reset();
- 
-@@ -757,6 +821,12 @@ private:
- 
-         params_base = params;
+@@ -1284,6 +1353,12 @@ private:
+             params_base.load_progress_callback_user_data = &load_progress_text;
+         }
  
 +        // ATLAS PC-202: install hidden-states capture callback BEFORE context init.
 +        // The callback always runs (cheap when no layers are requested) and consults
@@ -104,32 +111,48 @@ index 637f8d2..ff048a4 100644
 +
          llama_init = common_init_from_params(params_base);
  
-         model = llama_init->model();
-@@ -1720,6 +1790,32 @@ private:
+         model_tgt = llama_init->model();
+@@ -2454,6 +2529,48 @@ private:
              res->embedding.emplace_back(embd, embd + n_embd_out);
          }
  
-+        // ATLAS PC-202: slice per-token hidden states for this slot from the
-+        // batch-level capture buffer. Each layer's flat buffer is laid out as
-+        // [hidden_dim, batch_n_tokens] (ggml convention: ne[0] is fastest dim),
-+        // so token at batch position j starts at offset j * hidden_dim.
-+        // We collect ALL of slot.id's tokens (not just batch.logits[i]==1), so
-+        // PC-207 lens-as-PRM gets per-step states across the full prompt.
++        // ATLAS PC-202: hand this slot its tokens' hidden states. Each captured chunk
++        // is one sequence's ubatch, laid out [hidden_dim, n_tokens] (ggml convention:
++        // ne[0] is fastest), in the order sequences first appear in the batch (see
++        // atlas_hidden_states_capture). We return ALL of slot.id's tokens, not just
++        // the output ones, so PC-207 lens-as-PRM gets per-step states across the
++        // full prompt. If the chunks don't line up with the batch's sequences, the
++        // slot gets no hidden states rather than another sequence's.
 +        if (!slot.task->params.hidden_states_layers.empty()
 +                && hidden_states_capture.hidden_dim > 0) {
-+            const int H = hidden_states_capture.hidden_dim;
++            const size_t H = hidden_states_capture.hidden_dim;
++            std::vector<llama_seq_id> seq_order;
++            size_t n_slot_tokens = 0;
++            for (int j = 0; j < batch.size(); ++j) {
++                const llama_seq_id seq = batch.tokens[j].seq_id;
++                if (std::find(seq_order.begin(), seq_order.end(), seq) == seq_order.end()) {
++                    seq_order.push_back(seq);
++                }
++                n_slot_tokens += seq == slot.id;
++            }
++            const size_t chunk_idx = std::find(seq_order.begin(), seq_order.end(), slot.id) - seq_order.begin();
 +            res->hidden_dim = H;
 +            for (int layer_idx : slot.task->params.hidden_states_layers) {
 +                auto it = hidden_states_capture.captured.find(layer_idx);
 +                if (it == hidden_states_capture.captured.end()) {
 +                    continue;  // layer was not captured (e.g. cb_eval skipped due to dtype)
 +                }
-+                const auto & flat = it->second;
++                const auto & chunks = it->second;
++                if (chunks.size() != seq_order.size() || chunk_idx >= chunks.size()
++                        || chunks[chunk_idx].size() != n_slot_tokens * H) {
++                    SLT_WRN(slot, "hidden states for layer %d do not line up with the batch "
++                            "(%zu chunks, %zu sequences), dropping them\n",
++                            layer_idx, chunks.size(), seq_order.size());
++                    continue;
++                }
++                const auto & flat = chunks[chunk_idx];
 +                auto & out_layer = res->hidden_states[layer_idx];
-+                for (int j = 0; j < batch.n_tokens; ++j) {
-+                    if (batch.seq_id[j][0] != slot.id) continue;
-+                    const size_t off = (size_t)j * (size_t)H;
-+                    if (off + (size_t)H > flat.size()) break;  // bounds guard
++                for (size_t off = 0; off < flat.size(); off += H) {
 +                    out_layer.emplace_back(flat.begin() + off, flat.begin() + off + H);
 +                }
 +            }
@@ -138,33 +161,33 @@ index 637f8d2..ff048a4 100644
          SLT_DBG(slot, "%s", "sending embeddings\n");
  
          queue_results.send(std::move(res));
-@@ -2805,6 +2901,25 @@ private:
-                 batch.logits   + i,
-             };
+@@ -4553,6 +4670,25 @@ private:
+             has_output |= batch.tokens[i].output;
+         }
  
-+            // ATLAS PC-202: populate hidden-states capture state for THIS decode pass.
-+            // The cb_eval already installed at init consults this state; if no slot
-+            // wants hidden states, layers_wanted stays empty and the callback is a no-op
-+            // (just a name strncmp).
-+            hidden_states_capture.clear();
-+            for (auto & slot : slots) {
-+                if (slot.is_processing()
-+                        && slot.task->type == SERVER_TASK_TYPE_EMBEDDING
-+                        && !slot.task->params.hidden_states_layers.empty()) {
-+                    for (int l : slot.task->params.hidden_states_layers) {
-+                        hidden_states_capture.layers_wanted.insert(l);
-+                    }
++        // ATLAS PC-202: populate hidden-states capture state for THIS decode pass.
++        // The cb_eval already installed at init consults this state; if no slot
++        // wants hidden states, layers_wanted stays empty and the callback is a no-op
++        // (just a name strncmp).
++        hidden_states_capture.clear();
++        for (auto & slot : slots) {
++            if (slot.is_processing()
++                    && slot.task->type == SERVER_TASK_TYPE_EMBEDDING
++                    && !slot.task->params.hidden_states_layers.empty()) {
++                for (int l : slot.task->params.hidden_states_layers) {
++                    hidden_states_capture.layers_wanted.insert(l);
 +                }
 +            }
-+            if (!hidden_states_capture.layers_wanted.empty()) {
-+                hidden_states_capture.batch_n_tokens = n_tokens;
-+                hidden_states_capture.hidden_dim     = llama_model_n_embd(model);
-+            }
++        }
++        if (!hidden_states_capture.layers_wanted.empty()) {
++            hidden_states_capture.batch_n_tokens = batch.view.size();
++            hidden_states_capture.hidden_dim     = llama_model_n_embd(model_tgt);
++        }
 +
-             const int ret = llama_decode(ctx, batch_view);
- 
-             metrics.on_decoded(slots);
-@@ -4320,6 +4435,50 @@ std::unique_ptr<server_res_generator> server_routes::handle_embeddings_impl(cons
+         // yield to the queue, so we can still handle metrics tasks while decoding
+         // note: the sync is done here too, so that the wait is also covered by the yield
+         int ret = 0;
+@@ -6851,6 +6987,50 @@ std::unique_ptr<server_res_generator> server_routes::handle_embeddings_impl(cons
          }
      }
  
@@ -191,7 +214,7 @@ index 637f8d2..ff048a4 100644
 +                ERROR_TYPE_INVALID_REQUEST));
 +            return res;
 +        }
-+        const int n_layer = llama_model_n_layer(ctx_server.model);
++        const int n_layer = llama_model_n_layer(ctx_server.model_tgt);
 +        std::set<int> seen;
 +        for (const auto & v : layers_json) {
 +            if (!v.is_number_integer()) {
@@ -215,7 +238,7 @@ index 637f8d2..ff048a4 100644
      // create and queue the task
      json responses = json::array();
      auto & rd = res->rd;
-@@ -4335,6 +4494,9 @@ std::unique_ptr<server_res_generator> server_routes::handle_embeddings_impl(cons
+@@ -6866,6 +7046,9 @@ std::unique_ptr<server_res_generator> server_routes::handle_embeddings_impl(cons
              task.params.res_type = res_type;
              task.params.embd_normalize = embd_normalize;
  
@@ -226,7 +249,7 @@ index 637f8d2..ff048a4 100644
          }
          rd.post_tasks(std::move(tasks));
 diff --git a/tools/server/server-task.cpp b/tools/server/server-task.cpp
-index 45e5168..dcf3149 100644
+index d7ac2a1..fe6f223 100644
 --- a/tools/server/server-task.cpp
 +++ b/tools/server/server-task.cpp
 @@ -9,6 +9,7 @@
@@ -235,9 +258,9 @@ index 45e5168..dcf3149 100644
  #include "server-common.h"
 +#include "base64.hpp"
  
- using json = nlohmann::ordered_json;
+ #include <sstream>
  
-@@ -1823,10 +1824,38 @@ json server_task_result_embd::to_json() {
+@@ -1483,10 +1484,38 @@ json server_task_result_embd::to_json() {
  }
  
  json server_task_result_embd::to_json_non_oaicompat() {
@@ -278,10 +301,10 @@ index 45e5168..dcf3149 100644
  
  json server_task_result_embd::to_json_oaicompat() {
 diff --git a/tools/server/server-task.h b/tools/server/server-task.h
-index 289e1fb..1606fd0 100644
+index 810cefb..40fbeb1 100644
 --- a/tools/server/server-task.h
 +++ b/tools/server/server-task.h
-@@ -87,6 +87,11 @@ struct task_params {
+@@ -111,6 +111,11 @@ struct task_params {
      // Embeddings
      int32_t embd_normalize = 2; // (-1=none, 0=max absolute int16, 1=taxicab, 2=Euclidean/L2, >2=p-norm)
  
@@ -293,7 +316,7 @@ index 289e1fb..1606fd0 100644
      json format_logit_bias(const std::vector<llama_logit_bias> & logit_bias) const;
      json to_json(bool only_metrics = false) const;
  };
-@@ -470,6 +475,12 @@ struct server_task_result_embd : server_task_result {
+@@ -522,6 +527,12 @@ struct server_task_result_embd : server_task_result {
  
      int32_t n_tokens;
  

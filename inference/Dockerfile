@@ -3,7 +3,7 @@ FROM docker.io/nvidia/cuda:12.9.2-devel-rockylinux9@sha256:7edd399cf796b6603a33c
 RUN dnf install -y git cmake gcc-c++ && dnf clean all
 # Pin llama.cpp to a known-good SHA so the PC-202 patch applies cleanly.
 # Keep aligned with Dockerfile.v31 / Dockerfile.rocm / Dockerfile.vulkan.
-ARG LLAMA_CPP_REV=2e97c5f96f9fe2bb26f794a348e05d7a1c74baa1
+ARG LLAMA_CPP_REV=479a52779ff4c4674b81a226f8511816e15dc8dd
 RUN git init /llama.cpp && \
     cd /llama.cpp && \
     git remote add origin https://github.com/ggml-org/llama.cpp && \
@@ -12,8 +12,10 @@ RUN git init /llama.cpp && \
     # ATLAS patch: prevent --embeddings from poisoning the draft model context.
     # Without this, embedding=true propagates to the draft via params_dft = params_base,
     # causing output_all=true and n_ubatch mismatch → 0% spec decode acceptance.
-    # The sed below IS the patch; CI verifies the target line still exists
-    # at the pinned rev (test.yml llama-patches-apply).
+    # Newer revs derive the draft params with common_base_params_to_speculative,
+    # which clears embedding itself; the target line is gone and this sed is a
+    # no-op. CI checks one of the two holds at the pinned rev (test.yml
+    # llama-patches-apply).
     sed -i '/auto params_dft = params_base;/a\        params_dft.embedding = false;  // ATLAS: draft never needs embeddings' \
         tools/server/server-context.cpp && \
     cmake -B build -DGGML_CUDA=ON -DBUILD_SHARED_LIBS=OFF -DCMAKE_CUDA_ARCHITECTURES="120;121" && \

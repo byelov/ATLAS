@@ -337,28 +337,34 @@ jobs:
       - name: apply patches dry-run
         # Two things the Dockerfiles actually do on the cloned llama.cpp
         # tree before cmake; we mirror them both here:
-        #   1. `git apply` of expose-hidden-states.patch (PC-202).
-        #      Hard-fails the Docker build if it doesn't apply.
+        #   1. `git apply` of expose-hidden-states.patch (PC-202) and
+        #      fix-pooled-reserve.patch (upstream pooling bug fix).
+        #      Hard-fails the Docker build if either doesn't apply.
         #   2. `sed -i '/auto params_dft = params_base;/a ...'` for the
         #      spec-decode embeddings fix. The sed has `|| true`, so a
-        #      missing target line would silently no-op... we verify the
-        #      target line exists so that doesn't go unnoticed. The sed
-        #      IS the patch — there is no separate .patch file for it.
+        #      missing target line silently no-ops. That is fine only
+        #      when upstream clears the draft's embedding flag itself
+        #      (common_base_params_to_speculative, newer revs), so one
+        #      of the two must hold.
         run: |
           cd llama.cpp
-          # 1. PC-202 hidden-states patch
-          patch_path=../inference/patches/expose-hidden-states.patch
-          if git apply --check "$patch_path" 2>&1; then
-            echo "  OK: expose-hidden-states.patch applies to ${{ steps.sha.outputs.sha }}"
-          else
-            echo "::error file=inference/patches/expose-hidden-states.patch::patch does not apply to LLAMA_CPP_REV=${{ steps.sha.outputs.sha }}. See docs/TROUBLESHOOTING.md § 'llama.cpp patch drift' for the bump runbook."
-            exit 1
-          fi
-          # 2. spec-decode embeddings fix (sed target must exist)
+          # 1. ATLAS patches
+          for name in expose-hidden-states fix-pooled-reserve; do
+            patch_path=../inference/patches/$name.patch
+            if git apply --check "$patch_path" 2>&1; then
+              echo "  OK: $name.patch applies to ${{ steps.sha.outputs.sha }}"
+            else
+              echo "::error file=inference/patches/$name.patch::patch does not apply to LLAMA_CPP_REV=${{ steps.sha.outputs.sha }}. See docs/TROUBLESHOOTING.md § 'llama.cpp patch drift' for the bump runbook."
+              exit 1
+            fi
+          done
+          # 2. spec-decode embeddings fix (sed target, or upstream's own fix)
           if grep -q 'auto params_dft = params_base;' tools/server/server-context.cpp; then
             echo "  OK: spec-decode sed target present in server-context.cpp"
+          elif grep -Eq 'result\.embedding +=' common/speculative.cpp; then
+            echo "  OK: upstream clears the draft's embedding flag (common/speculative.cpp); the sed is a no-op"
           else
-            echo "::error::Dockerfile sed target 'auto params_dft = params_base;' not found in tools/server/server-context.cpp at LLAMA_CPP_REV=${{ steps.sha.outputs.sha }}. The embeddings spec-decode fix would silently no-op. See docs/TROUBLESHOOTING.md § 'llama.cpp patch drift'."
+            echo "::error::Neither the Dockerfile sed target 'auto params_dft = params_base;' (tools/server/server-context.cpp) nor upstream's draft-embedding fix (common/speculative.cpp) exists at LLAMA_CPP_REV=${{ steps.sha.outputs.sha }}. The draft would inherit --embeddings. See docs/TROUBLESHOOTING.md § 'llama.cpp patch drift'."
             exit 1
           fi
           echo "All patch checks passed."

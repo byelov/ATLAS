@@ -360,7 +360,7 @@ Developer-maintenance task. Two triggers land here:
 - **A dropped-in model fails to load** with `error loading model: unknown (model) architecture 'gemma4'` — the pinned llama.cpp predates that architecture.
 - **A build fails** with `error: patch failed: tools/server/server-context.cpp:NN` / `patch does not apply` — upstream drifted past the pinned SHA.
 
-The `atlas-llama` image pins llama.cpp via `LLAMA_CPP_REV` in all four Dockerfiles (`Dockerfile`, `Dockerfile.v31`, `Dockerfile.rocm`, `Dockerfile.vulkan`), and `Dockerfile.v31`, `Dockerfile.rocm`, and `Dockerfile.vulkan` — the three the compose files build from — apply `inference/patches/expose-hidden-states.patch` (the per-layer `hidden_states` extension the Geometric Lens depends on) during the build. The plain `Dockerfile` pins the rev but does not apply the patch, so a server built from it lacks the lens plumbing. To learn a new architecture, move the pin to a llama.cpp SHA that includes it. Prebuilt GHCR images skip the local build; only rebuild when you need an architecture newer than the published image.
+The `atlas-llama` image pins llama.cpp via `LLAMA_CPP_REV` in all four Dockerfiles (`Dockerfile`, `Dockerfile.v31`, `Dockerfile.rocm`, `Dockerfile.vulkan`), and `Dockerfile.v31`, `Dockerfile.rocm`, and `Dockerfile.vulkan` — the three the compose files build from — apply `inference/patches/expose-hidden-states.patch` (the per-layer `hidden_states` extension the Geometric Lens depends on) and `inference/patches/fix-pooled-reserve.patch` (an upstream bug fix: with `--pooling mean`, llama-server aborts at startup when `--parallel` doesn't divide the ubatch size) during the build. The macOS setup script applies the same two. The plain `Dockerfile` pins the rev but does not apply the patch, so a server built from it lacks the lens plumbing. To learn a new architecture, move the pin to a llama.cpp SHA that includes it. Prebuilt GHCR images skip the local build; only rebuild when you need an architecture newer than the published image.
 
 **Preserve the hidden-states patch — rebase it, don't delete it.** Removing the `git apply` step builds a server that has silently lost the lens plumbing (`/embedding` ignores the `layers:` parameter). Bump runbook:
 
@@ -371,8 +371,9 @@ The `atlas-llama` image pins llama.cpp via `LLAMA_CPP_REV` in all four Dockerfil
    git remote add origin https://github.com/ggml-org/llama.cpp
    git fetch --depth 1 origin <NEW_SHA> && git checkout -q FETCH_HEAD
    git apply --check $REPO/inference/patches/expose-hidden-states.patch
+   git apply --check $REPO/inference/patches/fix-pooled-reserve.patch
    ```
-   (Only this patch is `git apply`-ed. The spec-decode embeddings fix is a `sed` in the Dockerfiles, a no-op when its target line is absent.)
+   (These two are `git apply`-ed. The spec-decode embeddings fix is a `sed` in the Dockerfiles, a no-op when its target line is absent — fine on revisions where `common_base_params_to_speculative` clears the draft's `embedding` flag itself; CI requires one or the other. Drop `fix-pooled-reserve.patch` once upstream fixes `llama_context::graph_reserve`.)
 2. **If it applies cleanly:** bump `LLAMA_CPP_REV` in all four Dockerfiles to the new SHA. The CI smoke test verifies they agree.
 3. **If it fails:** `git apply --reject …` to land the clean hunks, re-insert each `*.rej` hunk at its moved anchor (watch for upstream renames in surrounding code, e.g. `model` → `model_tgt`, and update the patch's added lines), then `git diff > $REPO/inference/patches/expose-hidden-states.patch`. Re-run step 1. Compile just the server target CPU-only to catch member/type errors before the long CUDA build: `cmake -B build-cpu -DGGML_CUDA=OFF && cmake --build build-cpu --target llama-server`.
 4. Rebuild and bring up:

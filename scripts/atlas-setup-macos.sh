@@ -213,7 +213,8 @@ green "  Pinned SHA: $LLAMA_CPP_REV"
 # still reach installed binaries.)
 NEED_BUILD=1
 SHA_MARKER="$LLAMA_BIN_DIR/.llama_cpp_rev"
-BUILD_ID="$LLAMA_CPP_REV patch:$(shasum -a 256 "$PATCH_DIR/expose-hidden-states.patch" | cut -c1-16)"
+LLAMA_PATCHES=("$PATCH_DIR/expose-hidden-states.patch" "$PATCH_DIR/fix-pooled-reserve.patch")
+BUILD_ID="$LLAMA_CPP_REV patch:$(cat "${LLAMA_PATCHES[@]}" | shasum -a 256 | cut -c1-16)"
 if [[ -x "$LLAMA_SERVER" && -f "$SHA_MARKER" && $REBUILD -eq 0 ]]; then
   PREV_REV=$(cat "$SHA_MARKER")
   if [[ "$PREV_REV" == "$BUILD_ID" ]]; then
@@ -242,22 +243,33 @@ if [[ $NEED_BUILD -eq 1 ]]; then
         fetch --depth 1 origin "$LLAMA_CPP_REV"
     git checkout -q FETCH_HEAD
 
-    # Apply the hidden-states patch (real .patch file, must apply
-    # cleanly — CI gates on this via llama-patches-apply).
-    if ! git apply --check "$PATCH_DIR/expose-hidden-states.patch"; then
-      red "hidden-states patch does not apply to $LLAMA_CPP_REV."
-      red "  See docs/TROUBLESHOOTING.md § 'llama.cpp patch drift' for the bump runbook."
-      exit 1
-    fi
-    git apply "$PATCH_DIR/expose-hidden-states.patch"
+    # Apply the ATLAS patches (real .patch files, must apply cleanly —
+    # CI gates on this via llama-patches-apply): the hidden-states
+    # extension and an upstream pooled-embeddings fix.
+    for patch in "${LLAMA_PATCHES[@]}"; do
+      if ! git apply --check "$patch"; then
+        red "$(basename "$patch") does not apply to $LLAMA_CPP_REV."
+        red "  See docs/TROUBLESHOOTING.md § 'llama.cpp patch drift' for the bump runbook."
+        exit 1
+      fi
+      git apply "$patch"
+    done
 
-    # Apply the same spec-decode embeddings fix as the Dockerfiles.
-    sed -i.bak '/auto params_dft = params_base;/a\
+    # The draft model must not inherit --embeddings. Older revisions copy
+    # params_base wholesale, so apply the same sed as the Dockerfiles;
+    # newer ones derive the draft params with
+    # common_base_params_to_speculative, which clears it upstream.
+    if grep -q 'auto params_dft = params_base;' tools/server/server-context.cpp; then
+      sed -i.bak '/auto params_dft = params_base;/a\
         params_dft.embedding = false;  \/\/ ATLAS: draft never needs embeddings' \
-        tools/server/server-context.cpp
-    rm -f tools/server/server-context.cpp.bak
-    if ! grep -q 'params_dft.embedding = false' tools/server/server-context.cpp; then
-      red "spec-decode embeddings fix did not apply to $LLAMA_CPP_REV."
+          tools/server/server-context.cpp
+      rm -f tools/server/server-context.cpp.bak
+      if ! grep -q 'params_dft.embedding = false' tools/server/server-context.cpp; then
+        red "spec-decode embeddings fix did not apply to $LLAMA_CPP_REV."
+        exit 1
+      fi
+    elif ! grep -Eq 'result\.embedding +=' common/speculative.cpp; then
+      red "spec-decode embeddings fix: neither the sed target nor upstream's fix exists at $LLAMA_CPP_REV."
       exit 1
     fi
 
