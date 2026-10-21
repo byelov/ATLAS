@@ -707,6 +707,7 @@ def test_deploy_native_writes_native_env(tmp_path, monkeypatch, capsys):
     ATLAS_DEPLOY=native and points the operator at the native bring-up."""
     monkeypatch.setattr(tier, "probe", lambda install_dir=None: _apple_probe(128.0))
     monkeypatch.setattr(init, "_host_is_macos", lambda: True)
+    monkeypatch.delenv("ATLAS_LENS_MODELS", raising=False)
 
     root = _make_atlas_root(tmp_path)
     rc = _run(monkeypatch, root,
@@ -720,6 +721,35 @@ def test_deploy_native_writes_native_env(tmp_path, monkeypatch, capsys):
     assert "ATLAS_DEPLOY=native" in body
     assert "SETUP_MACOS_NATIVE.md" in body
     assert "docker-compose.macos.yml" not in body
+    # The model's own Lens bundle dir, not the shared tracked default.
+    assert "ATLAS_LENS_MODELS=./models/lens/Qwen3.5-9B-Q6_K" in body
+
+
+def test_deploy_native_fetches_the_lens_bundle_for_an_installed_model(
+        tmp_path, monkeypatch):
+    """Model already on disk: init still fills the per-model Lens dir, and
+    the ATLAS_LENS_MODELS it points the installer at doesn't leak into the
+    rest of the run (it would hide the value from .env)."""
+    monkeypatch.setattr(tier, "probe", lambda install_dir=None: _apple_probe(128.0))
+    monkeypatch.setattr(init, "_host_is_macos", lambda: True)
+    monkeypatch.delenv("ATLAS_LENS_MODELS", raising=False)
+    root = _make_atlas_root(tmp_path)
+    models = pathlib.Path(root, "models")
+    models.mkdir()
+    with open(models / "Qwen3.5-9B-Q6_K.gguf", "wb") as fh:
+        fh.truncate(101 * 1024 * 1024)  # sparse; passes is_installed
+    calls = []
+    monkeypatch.setattr(init.model, "main", lambda argv: calls.append(
+        (argv, os.environ.get("ATLAS_LENS_MODELS"))) or 0)
+
+    assert _run(monkeypatch, root,
+                ["--yes", "--no-color", "--deploy", "native"]) == 0
+    (argv, lens_env), = calls
+    assert argv[:2] == ["install-artifacts", "Qwen3.5-9B-Q6_K"]
+    assert lens_env == str(models / "lens" / "Qwen3.5-9B-Q6_K")
+    assert "ATLAS_LENS_MODELS" not in os.environ
+    assert "ATLAS_LENS_MODELS=./models/lens/Qwen3.5-9B-Q6_K" in pathlib.Path(
+        root, ".env").read_text()
 
 
 def test_deploy_native_refused_off_macos(tmp_path, monkeypatch):

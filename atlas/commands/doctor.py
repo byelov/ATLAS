@@ -618,6 +618,30 @@ def check_health_endpoints() -> List[CheckResult]:
     return results
 
 
+def _sandbox_accepts_wrong_token() -> Optional[CheckResult]:
+    """The sandbox runs arbitrary commands, and an executor that can't read
+    its token file starts with auth off. An empty /syntax-check body runs
+    nothing either way: 401 when the token is enforced, 422 when it isn't.
+    None when enforced or unreachable (health/sandbox reports that)."""
+    req = urllib.request.Request(
+        f"{SANDBOX_URL}/syntax-check", data=b"{}", method="POST",
+        headers={"Content-Type": "application/json",
+                 "Authorization": "Bearer atlas-doctor-wrong-token"})
+    try:
+        urllib.request.urlopen(req, timeout=5)
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            return None
+    except Exception:
+        return None
+    return CheckResult(
+        "internal_auth", "fail",
+        "the sandbox accepts requests without the service token",
+        "the executor could not read secrets/service-token at startup; "
+        "restart it (`atlas native restart sandbox` or "
+        "`docker compose up -d sandbox`) and check its log")
+
+
 def check_internal_auth(atlas_root: str) -> List[CheckResult]:
     """Internal service auth: token file status + live enforcement.
 
@@ -663,6 +687,10 @@ def check_internal_auth(atlas_root: str) -> List[CheckResult]:
                 "token file present but the proxy accepts wrong tokens",
                 "the proxy container predates the token or lacks the "
                 "secrets mount — docker compose up -d atlas-proxy"))
+            return results
+        sandbox_open = _sandbox_accepts_wrong_token()
+        if sandbox_open:
+            results.append(sandbox_open)
             return results
         req2 = urllib.request.Request(probe_url, method="GET")
         req2.add_header("Authorization", f"Bearer {tok}")

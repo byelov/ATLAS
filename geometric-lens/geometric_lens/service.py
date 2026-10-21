@@ -12,6 +12,8 @@ import threading
 import time
 from typing import Optional, Tuple
 
+from geometric_lens import default_models_dir
+
 logger = logging.getLogger(__name__)
 
 # Guards the mutable model globals below. reload_weights()/_ensure_models_loaded
@@ -366,7 +368,7 @@ def _do_load_models() -> bool:
         import torch
         from geometric_lens.cost_field import CostField
 
-        models_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
+        models_dir = default_models_dir()
         cost_path = os.path.join(models_dir, "cost_field.pt")
 
         if not os.path.exists(cost_path):

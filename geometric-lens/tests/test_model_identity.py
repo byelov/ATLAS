@@ -57,3 +57,14 @@ def test_service_requires_identity_for_selected_model(tmp_path, monkeypatch):
     assert not service._verify_model_identity(str(tmp_path))
     save_model_identity(str(tmp_path), "/models/selected-model.gguf", 4096)
     assert service._verify_model_identity(str(tmp_path))
+
+
+def test_models_dir_defaults_to_package_and_env_overrides(tmp_path, monkeypatch):
+    """The native deploy has no bind mount over geometric_lens/models; it
+    passes the bundle dir as ATLAS_LENS_MODELS_DIR instead."""
+    from geometric_lens import default_models_dir
+    monkeypatch.delenv("ATLAS_LENS_MODELS_DIR", raising=False)
+    assert default_models_dir() == os.path.join(
+        os.path.dirname(os.path.abspath(service.__file__)), "models")
+    monkeypatch.setenv("ATLAS_LENS_MODELS_DIR", str(tmp_path))
+    assert default_models_dir() == str(tmp_path)

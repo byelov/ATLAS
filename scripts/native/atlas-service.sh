@@ -183,13 +183,12 @@ case "$SERVICE" in
 
   # -------------------------------------------------------------------------
   geometric-lens)
+    # Compose bind-mounts ATLAS_LENS_MODELS over the lens's artifact dir;
+    # natively the lens reads the same directory from ATLAS_LENS_MODELS_DIR.
     lens_models="$(abs_path "${ATLAS_LENS_MODELS:-./geometric-lens/geometric_lens/models}")"
-    if [[ "$lens_models" != "$ATLAS_ROOT/geometric-lens/geometric_lens/models" ]]; then
-      log "WARNING: ATLAS_LENS_MODELS=$lens_models is ignored natively;"
-      log "         the lens loads geometric-lens/geometric_lens/models."
-    fi
     mkdir -p "$STATE/lens"
     svc_env+=(
+      ATLAS_LENS_MODELS_DIR="$lens_models"
       LLAMA_URL="$LLAMA_URL"
       LLAMA_EMBED_URL="$LLAMA_URL"
       ATLAS_MODEL_NAME="$MODEL_NAME"
@@ -266,6 +265,13 @@ case "$SERVICE" in
       --deny-port "$LLAMA_PORT" --deny-port "$LENS_PORT" \
       --deny-port "$V3_PORT" --deny-port "$PROXY_PORT" \
       ${ATLAS_SANDBOX_NET_INTERNAL:+--net-internal "$ATLAS_SANDBOX_NET_INTERNAL"}
+
+    # The executor treats an unreadable token file as "auth disabled". The
+    # token exists, so if the profile hides it, refuse to start open.
+    if [[ ${#token_env[@]} -gt 0 && "${ATLAS_NATIVE_DRY_RUN:-0}" != "1" ]] &&
+       ! /usr/bin/sandbox-exec -f "$profile" /bin/cat "$TOKEN_FILE" >/dev/null 2>&1; then
+      die "the Seatbelt profile hides $TOKEN_FILE; the executor would run without auth"
+    fi
 
     svc_env=(
       HOME="$sbx_home"

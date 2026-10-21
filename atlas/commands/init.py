@@ -408,16 +408,51 @@ def _step_select_model(profile: tier.TierProfile,
 # Step 3 — download (delegate to atlas model install)
 # ---------------------------------------------------------------------------
 
+def _native_lens_models(m: model_registry.Model, models_value: str) -> Optional[str]:
+    """ATLAS_LENS_MODELS for the native deploy: a Lens bundle directory of
+    the model's own under the models dir. The shared default
+    (geometric-lens/geometric_lens/models) is tracked in git and carries
+    another model's identity and C(x) calibration."""
+    if os.environ.get("ATLAS_LENS_MODELS"):
+        return None  # operator's choice wins
+    if not (m.lens_artifact_url_base and m.lens_artifact_files):
+        return None
+    return os.path.join(models_value, "lens", m.name)
+
+
+@contextlib.contextmanager
+def _lens_models_env(lens_dir: Optional[str]):
+    """Point the installer at lens_dir for one call. .env doesn't exist
+    yet; step 4 writes the same value."""
+    if not lens_dir:
+        yield
+        return
+    os.environ["ATLAS_LENS_MODELS"] = lens_dir
+    try:
+        yield
+    finally:
+        os.environ.pop("ATLAS_LENS_MODELS", None)
+
+
 def _step_download(m: model_registry.Model, models_dir: str,
-                    args: argparse.Namespace, color: bool) -> int:
+                   args: argparse.Namespace, color: bool) -> int:
     """Returns 0 on success (or already-installed), non-zero on failure.
     Skips when --skip-download or --dry-run."""
     if args.skip_download:
         _safe_print(f"  Skipping download (--skip-download). "
                     f"Place {m.model_file} in {models_dir} before bringing the stack up.")
         return 0
+    lens_dir = (_native_lens_models(m, models_dir)
+                if getattr(args, "deploy", None) == "native" else None)
     if model_registry.is_installed(m, models_dir):
         _safe_print(f"  Already installed: {os.path.join(models_dir, m.model_file)}")
+        if lens_dir and not args.dry_run:
+            # Fetch whatever this model's own Lens/ASA bundle is missing.
+            artifacts_argv = ["install-artifacts", m.name, "--models-dir", models_dir]
+            if args.no_color:
+                artifacts_argv.append("--no-color")
+            with _lens_models_env(lens_dir):
+                return model.main(artifacts_argv)
         return 0
     if args.dry_run:
         _safe_print(f"  (dry-run) would install {m.name} into {models_dir}")
@@ -430,7 +465,8 @@ def _step_download(m: model_registry.Model, models_dir: str,
         install_argv.append("--no-color")
     if args.yes:
         install_argv.append("--yes")
-    rc = model.main(install_argv)
+    with _lens_models_env(lens_dir):
+        rc = model.main(install_argv)
     if rc != 0:
         _safe_print(f"  {RED if color else ''}Model install failed (rc={rc}). "
                     f"Re-run `atlas model install {m.name}` after resolving the issue, "
@@ -585,6 +621,9 @@ def _render_env(m: model_registry.Model, profile: tier.TierProfile,
     }
     if deploy == "native":
         keys["ATLAS_DEPLOY"] = "native"
+        lens_models = _native_lens_models(m, models_value)
+        if lens_models:
+            keys["ATLAS_LENS_MODELS"] = lens_models
 
     gpu_descr = (f"{selected_gpu.name} ({selected_gpu.vram_gb:.1f} GB VRAM)"
                  if selected_gpu else "none")

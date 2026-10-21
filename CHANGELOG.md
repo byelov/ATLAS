@@ -10,7 +10,17 @@
 - `./scripts/atlas-setup-macos.sh --native` builds the proxy and one venv per service from the images' pinned requirements (Python 3.12 for lens/v3, 3.13 for the sandbox plus a writable tools venv for executed code).
 - `atlas init --deploy native` writes `ATLAS_DEPLOY=native`. `atlas doctor` checks the agents, runtime and Seatbelt profile instead of Docker, `atlas diagnostics` bundles the launchd logs, and `atlas` starts the launchd proxy and re-points the sandbox at the launch directory instead of recreating containers.
 - New bind-address settings, defaulting to the old behaviour: `ATLAS_PROXY_HOST`, `ATLAS_V3_HOST`, `ATLAS_SANDBOX_HOST`, plus `ATLAS_SANDBOX_PORT` for the executor's own listen port.
+- Each agent's program is `atlas-service.sh` itself (not `/bin/bash`), so System Settings > Login Items lists them by that name. `atlas native install` and `atlas native status` say how to turn them back on there; switching them off boots the agents out and keeps them from starting at login.
+- The lens reads its artifact directory from `ATLAS_LENS_MODELS_DIR` when set (the native wrapper passes `ATLAS_LENS_MODELS`; compose still bind-mounts it). `atlas init --deploy native` gives the model a Lens bundle directory of its own, `./models/lens/<model>`.
 - Docs: [SETUP_MACOS_NATIVE.md](docs/SETUP_MACOS_NATIVE.md).
+
+- The native wrapper refuses to start the sandbox if its Seatbelt profile hides the service token (the executor would otherwise run without auth). The profile names `file-read-data` in its secrets and token rules: Seatbelt lets an operation-specific rule beat a `file-read*` rule regardless of order, so a checkout under the home directory hid the token, and a project that is the checkout itself could read `secrets/`.
+
+### Fixed: `atlas doctor` reported auth enforced while the sandbox ran open
+- `internal_auth` probed only the proxy. It now also sends the sandbox an empty `/syntax-check` with a wrong token (nothing executes either way) and fails if that isn't a 401. An executor that can't read `secrets/service-token` starts with auth off.
+
+### Fixed: a fresh Qwen3.5-9B-Q6_K install failed the lens self-test
+- The tracked `geometric-lens/geometric_lens/models` bundle identifies gemma-4-12b-it-Q4_K_M (and carries its C(x) calibration). `atlas model install` skipped that `model_identity.json` as "already present", so the lens refused to start: `artifacts are for 'gemma-4-12b-it-Q4_K_M'`. The installer now refuses to mix one model's Lens files into another model's bundle and says to point `ATLAS_LENS_MODELS` at a directory of its own (`--force-artifacts` still overwrites).
 
 ### Apple Silicon sizing and speed
 - `atlas tier fit` budgets the Metal working-set limit (≈2/3 of RAM up to 36 GiB, ≈3/4 above, `iogpu.wired_limit_mb` if set, minus an 8 GiB host reserve) instead of all of unified memory. New `--per-slot-cap` raises the 32K per-slot ceiling, e.g. `--slots 6 --per-slot-cap 65536` on a 128 GB M1 Ultra.

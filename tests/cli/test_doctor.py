@@ -12,8 +12,11 @@ real CI runs. These tests cover the new check_metal_native() added in
      for non-Mac users
 """
 
+import io
 import json
 import sys
+
+import pytest
 
 from atlas.commands import doctor
 
@@ -439,3 +442,52 @@ def test_workspace_mounts_skip_when_not_running():
     result = doctor.check_workspace_mounts(
         [{"Service": "atlas-proxy", "Name": "x", "State": "running"}])
     assert result.status == "skip"
+
+
+# ---------------------------------------------------------------------------
+# internal_auth: the sandbox probe
+# ---------------------------------------------------------------------------
+
+def _fake_urlopen(monkeypatch, codes):
+    """codes: URL substring -> HTTP status urlopen yields for it."""
+    import urllib.error
+
+    def fake(req, timeout=None):
+        url = req.full_url if hasattr(req, "full_url") else req
+        for part, code in codes.items():
+            if part in url:
+                if code >= 400:
+                    raise urllib.error.HTTPError(url, code, "x", {}, None)
+                return io.BytesIO(b"{}")
+        raise urllib.error.URLError("unreachable")
+    monkeypatch.setattr(doctor.urllib.request, "urlopen", fake)
+
+
+def test_sandbox_probe_executes_nothing_and_flags_an_open_executor(monkeypatch):
+    seen = []
+    _fake_urlopen(monkeypatch, {"/syntax-check": 422})
+    real = doctor.urllib.request.urlopen
+    monkeypatch.setattr(doctor.urllib.request, "urlopen",
+                        lambda req, timeout=None: seen.append(req) or real(req, timeout))
+    result = doctor._sandbox_accepts_wrong_token()
+    assert result is not None and result.status == "fail"
+    (req,) = seen
+    assert req.get_method() == "POST" and req.data == b"{}"
+    assert req.full_url.endswith("/syntax-check")
+
+
+@pytest.mark.parametrize("codes", [{"/syntax-check": 401}, {}])
+def test_sandbox_probe_passes_when_enforced_or_unreachable(monkeypatch, codes):
+    _fake_urlopen(monkeypatch, codes)
+    assert doctor._sandbox_accepts_wrong_token() is None
+
+
+def test_internal_auth_fails_when_only_the_proxy_enforces(monkeypatch, tmp_path):
+    from atlas import token as token_mod
+    monkeypatch.setattr(token_mod, "check_file_permissions",
+                        lambda root: (True, ""))
+    monkeypatch.setattr(token_mod, "read_token", lambda root: "tok")
+    _fake_urlopen(monkeypatch, {"/v1/models": 401, "/syntax-check": 422})
+    (result,) = doctor.check_internal_auth(str(tmp_path))
+    assert result.status == "fail"
+    assert "sandbox" in result.message

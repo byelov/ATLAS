@@ -76,8 +76,14 @@ rebuilds what changed.
 
 ### 2. `atlas init --deploy native`
 
-The usual wizard, plus `ATLAS_DEPLOY=native` in `.env`. On a Mac the KV cache
-always gets **matching K and V types**. Metal's flash-attention kernel rejects
+The usual wizard, plus two native settings in `.env`:
+- `ATLAS_DEPLOY=native`.
+- `ATLAS_LENS_MODELS=./models/lens/<model>`: the model's own Lens bundle
+  directory. The model download fills it (cost field and identity). The tracked
+  `geometric-lens/geometric_lens/models` bundle belongs to another model, and
+  the lens refuses artifacts whose identity doesn't match the served model.
+
+On a Mac the KV cache always gets **matching K and V types**. Metal's flash-attention kernel rejects
 mixed types (`ggml-metal-device.m`), and that silently moves attention onto the
 CPU.
 
@@ -139,6 +145,13 @@ native counterpart of one compose service entry:
 that don't set it. Everything on the request path is `Interactive`. The sandbox
 runs `Standard` at nice 5, so a build or test run never competes with token
 generation.
+
+macOS then shows **"Background Items Added"**. The agents are listed as
+`atlas-service.sh` under **System Settings → General → Login Items &
+Extensions → Allow in the Background**. Leave them on. Switching one off
+stops it immediately and keeps it from starting at login. `atlas native start`
+still loads it for the current session, and `atlas native status` points this
+out.
 
 Agents start at login and restart after a crash (`KeepAlive`, 10 s throttle).
 `atlas native stop` unloads and disables them, so they stay down across logins
@@ -205,7 +218,8 @@ atlas native uninstall              # unload + remove the LaunchAgents
 **Upgrading:** `git pull`, then `./scripts/atlas-setup-macos.sh --native`, then
 `atlas native install`. The install step rewrites and reloads the agents.
 
-**State:** lens SQLite in `~/.atlas/native/state/lens/`, V3 telemetry in
+**State:** the Lens bundle in `./models/lens/<model>/`, lens SQLite in
+`~/.atlas/native/state/lens/`, V3 telemetry in
 `~/.atlas/native/state/v3-telemetry/`, lens training samples in
 `./lens_training` (same as compose).
 
@@ -226,6 +240,15 @@ These commands drive containers and don't have native versions yet:
 `ATLAS_NATIVE_DEP_TIMEOUT` (default 600 s) exits, and launchd retries it. The
 usual cause is llama-server: a missing model file or a context that doesn't fit.
 Re-run `atlas tier fit --write`.
+
+**Every agent shows `loaded: no` in `atlas native status`.** They were
+switched off under Login Items. Turn the `atlas-service.sh` entries back on
+(see step 4), or run `atlas native start` to load them for this session.
+
+**The lens logs `artifacts are for 'gemma-4-12b-it-Q4_K_M'`.** It is reading the
+shared tracked bundle. Set `ATLAS_LENS_MODELS=./models/lens/<model>` in `.env`,
+then run `atlas model install-artifacts <model>` and
+`atlas native restart geometric-lens`.
 
 **`missing venv … run ./scripts/atlas-setup-macos.sh --native`.** The setup
 script wasn't run with `--native`, or `ATLAS_MACOS_PREFIX` points elsewhere.

@@ -26,6 +26,7 @@ import argparse
 import json
 import os
 import plistlib
+import stat
 import subprocess
 import sys
 import time
@@ -102,6 +103,10 @@ def log_path(service: str) -> str:
     return os.path.join(log_dir(), f"{service}.log")
 
 
+def wrapper_path(atlas_root: str) -> str:
+    return os.path.join(atlas_root, "scripts", "native", "atlas-service.sh")
+
+
 def native_home() -> str:
     return os.path.expanduser(
         _env_value("ATLAS_NATIVE_HOME", os.path.join(_home(), ".atlas",
@@ -127,11 +132,10 @@ def build_plist(service: str, atlas_root: str, home: str) -> Dict:
     log = os.path.join(home, "Library", "Logs", "atlas", f"{service}.log")
     plist = {
         "Label": label(service),
-        "ProgramArguments": [
-            "/bin/bash",
-            os.path.join(atlas_root, "scripts", "native", "atlas-service.sh"),
-            service,
-        ],
+        # The wrapper itself is the program (shebang), not /bin/bash: System
+        # Settings > Login Items lists an agent by its executable's name, and
+        # five anonymous "bash" entries invite being switched off.
+        "ProgramArguments": [wrapper_path(atlas_root), service],
         "WorkingDirectory": atlas_root,
         "EnvironmentVariables": {
             "ATLAS_ROOT": atlas_root,
@@ -254,6 +258,9 @@ def _subpaths(paths: Sequence[str]) -> str:
     return " ".join(f"(subpath {sbpl_string(p)})" for p in paths if p)
 
 
+_SECRET_READ_OPS = "file-read* file-read-data file-read-xattr"
+
+
 def render_seatbelt_profile(cfg: SeatbeltConfig) -> str:
     """Seatbelt (SBPL) profile for the sandbox service and everything it
     runs. Later rules override earlier ones, so each section narrows the
@@ -327,13 +334,18 @@ def render_seatbelt_profile(cfg: SeatbeltConfig) -> str:
         + "".join(" " + c for c in darwin_caches) + ")",
         "",
         ";; Secrets: unreadable even inside the project, except the token",
-        ";; the executor authenticates requests with.",
-        f"(deny file-read* (subpath {sbpl_string(secrets)})"
+        ";; the executor authenticates requests with. The operations are",
+        ";; named, not just file-read*: Seatbelt lets a rule for a specific",
+        ";; operation beat a file-read* rule whatever their order, so the",
+        ";; project allow above would re-open secrets/, and the home deny",
+        ";; would hide the token (the executor then runs without auth).",
+        f"(deny {_SECRET_READ_OPS} (subpath {sbpl_string(secrets)})"
         f" (literal {sbpl_string(os.path.join(root, '.env'))}))",
     ]
     if cfg.token_file:
         lines.append(
-            f"(allow file-read* (literal {sbpl_string(_real(cfg.token_file))}))")
+            f"(allow {_SECRET_READ_OPS}"
+            f" (literal {sbpl_string(_real(cfg.token_file))}))")
     lines += [
         "",
         ";; Writes: the project, the private home/tmp, the xcrun/clang",
@@ -464,6 +476,14 @@ def _require_macos() -> Optional[int]:
     return None
 
 
+# Switching an agent off under Login Items boots it out at once and keeps it
+# from loading at login; `launchctl bootstrap` still works for the session.
+_LOGIN_ITEMS_HINT = (
+    "macOS lists the agents as \"atlas-service.sh\" under System Settings > "
+    "General > Login Items & Extensions > Allow in the Background; keep them "
+    "on or they won't start at login.")
+
+
 def _write_plist(service: str) -> str:
     path = plist_path(service)
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -493,6 +513,12 @@ def _bootout(service: str) -> None:
 
 
 def _cmd_install(args: argparse.Namespace) -> int:
+    # launchd execs the wrapper directly; a checkout without the exec bit
+    # (archive download, core.fileMode=false) would fail every spawn.
+    wrapper = wrapper_path(_atlas_root())
+    mode = os.stat(wrapper).st_mode
+    if not mode & stat.S_IXUSR:
+        os.chmod(wrapper, mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
     ok = True
     for service in _select(args.services):
         path = _write_plist(service)
@@ -505,6 +531,7 @@ def _cmd_install(args: argparse.Namespace) -> int:
     if ok:
         print(f"  logs: {log_dir()}/<service>.log — "
               f"`atlas native status` to watch them come up")
+        print(f"  {_LOGIN_ITEMS_HINT}")
     return 0 if ok else 1
 
 
@@ -591,6 +618,10 @@ def _cmd_status(args: argparse.Namespace) -> int:
             health = "ok" if r["healthy"] else ("down" if r["loaded"] else "-")
             print(f"  {r['service']:<15} {loaded:<7} {r['pid']:<7} "
                   f"{health:<8} {r['last_exit']}")
+        if any(r["installed"] and not r["loaded"] for r in rows):
+            print("\n  Installed but not loaded: `atlas native start` loads "
+                  "them now.")
+            print(f"  {_LOGIN_ITEMS_HINT}")
     return 0 if all(r["healthy"] for r in rows) else 1
 
 

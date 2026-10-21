@@ -2,6 +2,7 @@
 sandbox Seatbelt profile, the per-service wrapper, and the CLI paths that
 branch on ATLAS_DEPLOY=native."""
 
+import argparse
 import os
 import pathlib
 import plistlib
@@ -47,8 +48,10 @@ def test_plist_runs_the_wrapper_for_each_service(service, monkeypatch):
     monkeypatch.setattr(native, "_atlas_root", lambda: "/opt/atlas")
     plist = native.build_plist(service, "/opt/atlas", "/Users/me")
     assert plist["Label"] == f"ai.atlas.{service}"
+    # The wrapper is the program itself, so Login Items names the agent
+    # "atlas-service.sh" rather than "bash".
     assert plist["ProgramArguments"] == [
-        "/bin/bash", "/opt/atlas/scripts/native/atlas-service.sh", service]
+        "/opt/atlas/scripts/native/atlas-service.sh", service]
     assert plist["EnvironmentVariables"]["ATLAS_ROOT"] == "/opt/atlas"
     assert plist["RunAtLoad"] is True
     assert plist["KeepAlive"] == {"SuccessfulExit": False}
@@ -83,6 +86,49 @@ def test_rendered_plist_passes_plutil(tmp_path, monkeypatch):
     result = subprocess.run(["plutil", "-lint", str(path)],
                             capture_output=True, text=True)
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def _fake_launchd(monkeypatch, tmp_path, loaded=False):
+    """Point install/status at a temp checkout + home with launchctl faked."""
+    root = tmp_path / "atlas"
+    (root / "scripts" / "native").mkdir(parents=True)
+    wrapper = root / "scripts" / "native" / "atlas-service.sh"
+    wrapper.write_text("#!/usr/bin/env bash\n")
+    home = tmp_path / "home"
+    monkeypatch.delenv("ATLAS_LAUNCHD_PREFIX", raising=False)
+    monkeypatch.setattr(native, "_atlas_root", lambda: str(root))
+    monkeypatch.setattr(native, "_home", lambda: str(home))
+    calls = []
+    monkeypatch.setattr(native, "_launchctl", lambda *a: calls.append(a) or
+                        subprocess.CompletedProcess(a, 0, "", ""))
+    monkeypatch.setattr(native, "_print_info",
+                        lambda s: {"pid": "1"} if loaded else {})
+    monkeypatch.setattr(native, "_health", lambda s, timeout=3.0: loaded)
+    return wrapper, calls
+
+
+def test_install_restores_wrapper_exec_bit_and_explains_login_items(
+        tmp_path, monkeypatch, capsys):
+    wrapper, calls = _fake_launchd(monkeypatch, tmp_path)
+    wrapper.chmod(0o644)  # e.g. a checkout from an archive
+    assert native._cmd_install(argparse.Namespace(services=[])) == 0
+    assert os.access(wrapper, os.X_OK)
+    plist = plistlib.loads(pathlib.Path(native.plist_path("sandbox")).read_bytes())
+    assert plist["ProgramArguments"] == [str(wrapper), "sandbox"]
+    assert [c[0] for c in calls if c[0] == "bootstrap"] == ["bootstrap"] * len(
+        native.SERVICES)
+    assert "atlas-service.sh" in capsys.readouterr().out
+
+
+def test_status_explains_installed_but_unloaded_agents(tmp_path, monkeypatch,
+                                                       capsys):
+    _fake_launchd(monkeypatch, tmp_path, loaded=False)
+    assert native._cmd_install(argparse.Namespace(services=[])) == 0
+    capsys.readouterr()
+    assert native._cmd_status(argparse.Namespace(json=False)) == 1
+    out = capsys.readouterr().out
+    assert "atlas native start" in out
+    assert "Login Items" in out
 
 
 def test_unknown_service_rejected():
@@ -123,7 +169,7 @@ def test_profile_rule_order_narrows_each_section(tmp_path):
     assert text.index("(deny file-read-data") < text.index(
         "(allow file-read-data")
     assert text.index("(allow file-read-data") < text.index(
-        "(deny file-read* (subpath " + native.sbpl_string(
+        f"(deny {native._SECRET_READ_OPS} (subpath " + native.sbpl_string(
             real(str(tmp_path / "atlas" / "secrets"))))
     assert text.index("(deny file-write*)") < text.index("(allow file-write*")
     assert text.index("(allow file-write*") < text.index(
@@ -178,6 +224,31 @@ def test_profile_enforces_the_sandbox_boundary(tmp_path):
     assert run(f"mkdir -p '{project}/.git/hooks' && "
                f"echo x > '{project}/.git/hooks/pre-commit'") != 0
     assert run("/bin/launchctl list >/dev/null") != 0
+
+
+@macos_only
+@pytest.mark.parametrize("project_is_checkout", [False, True])
+def test_profile_secrets_hold_when_the_checkout_is_under_home(
+        tmp_path, project_is_checkout):
+    """The usual layout: the checkout (and its secrets/) inside the home
+    directory. Seatbelt lets a file-read-data rule beat a file-read* rule
+    regardless of order, so the token re-allow must name file-read-data to
+    beat the home deny (else the executor starts without auth), and the
+    secrets deny must too, to beat the project allow when the project is
+    the checkout."""
+    cfg = _cfg(tmp_path, real_home=str(tmp_path))
+    if project_is_checkout:
+        cfg = _cfg(tmp_path, real_home=str(tmp_path), project=cfg.atlas_root)
+    profile = tmp_path / "p.sb"
+    profile.write_text(native.render_seatbelt_profile(cfg))
+
+    def cat(path):
+        return subprocess.run(
+            ["/usr/bin/sandbox-exec", "-f", str(profile), "/bin/cat", path],
+            capture_output=True, text=True, timeout=20).returncode
+
+    assert cat(cfg.token_file) == 0
+    assert cat(os.path.join(cfg.secrets, "api-keys.json")) != 0
 
 
 # ---------------------------------------------------------------------------
@@ -264,9 +335,20 @@ def test_wrapper_services_bind_loopback(tmp_path):
     lens = _dry_run("geometric-lens", env)
     assert "--host 127.0.0.1 --port 8099" in lens["cmd"]
     assert lens["env"]["LLAMA_URL"] == "http://127.0.0.1:8080"
+    # No bind mount natively: compose's default lens dir, passed by env.
+    assert lens["env"]["ATLAS_LENS_MODELS_DIR"] == str(
+        ROOT / "geometric-lens" / "geometric_lens" / "models")
     llama = _dry_run("llama-server", env)
     assert llama["env"]["ATLAS_LLAMA_HOST"] == "127.0.0.1"
     assert llama["cmd"].endswith("scripts/atlas-llama-macos.sh")
+
+
+def test_wrapper_passes_a_per_model_lens_dir(tmp_path):
+    env, _ = _wrapper_env(tmp_path)
+    env["ATLAS_LENS_MODELS"] = "./models/lens/fixture-model"
+    lens = _dry_run("geometric-lens", env)
+    assert lens["env"]["ATLAS_LENS_MODELS_DIR"] == str(
+        ROOT / "models" / "lens" / "fixture-model")
 
 
 def test_wrapper_honors_port_overrides(tmp_path):

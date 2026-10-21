@@ -15,6 +15,7 @@ from pipeline import (
     retrieve_cached_patterns, record_pattern_access,
     write_pattern_async, record_pattern_outcome,
 )
+from geometric_lens import default_models_dir
 from geometric_lens.auth_token import auth_headers as _svc_auth_headers
 
 
@@ -572,10 +573,7 @@ def _models_dir_writable(models_dir: str) -> bool:
 @app.post("/internal/lens/retrain")
 def lens_retrain(request: LensRetrainRequest):
     """Retrain C(x) on accumulated pass/fail embeddings from benchmark execution."""
-    models_dir = os.path.join(
-        os.path.dirname(os.path.abspath(__file__)),
-        "geometric_lens", "models"
-    )
+    models_dir = default_models_dir()
     # Fail before burning a training run: in the standard compose deployment
     # the models dir is mounted read-only into this container.
     if not _models_dir_writable(models_dir):

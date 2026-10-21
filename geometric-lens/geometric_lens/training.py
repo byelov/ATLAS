@@ -19,6 +19,7 @@ import torch.optim as optim
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from geometric_lens import default_models_dir
 from geometric_lens.cost_field import CostField
 from geometric_lens.thresholds import derive_gx_thresholds as _derive_gx_thresholds
 
@@ -240,7 +241,7 @@ def save_cost_field(cost_field, save_dir=None, normalization=None):
     a stale safetensors from a previous model shadowing a fresh .pt.
     """
     if save_dir is None:
-        save_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
+        save_dir = default_models_dir()
     os.makedirs(save_dir, exist_ok=True)
 
     cost_path = os.path.join(save_dir, "cost_field.pt")
@@ -405,7 +406,7 @@ def save_gx(gx_result: dict, save_dir=None):
     ever deleted.
     """
     if save_dir is None:
-        save_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
+        save_dir = default_models_dir()
     os.makedirs(save_dir, exist_ok=True)
 
     xgb_path = os.path.join(save_dir, "gx_xgboost.json")
@@ -440,7 +441,7 @@ def load_cost_field(save_dir=None, dim=None):
     an explicit dimension; fabricating one would silently select a model shape.
     """
     if save_dir is None:
-        save_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
+        save_dir = default_models_dir()
 
     cost_path = os.path.join(save_dir, "cost_field.pt")
     if dim is None:

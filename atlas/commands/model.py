@@ -56,6 +56,7 @@ from atlas.commands import model_registry, tier
 from atlas.commands.model_registry import Model
 # HF token resolution is shared publish machinery; the canonical resolver
 # (which also reads HUGGINGFACE_HUB_TOKEN) lives in atlas.publishing.
+from atlas import publishing
 from atlas.publishing import hf_token as _hf_token
 
 
@@ -554,7 +555,28 @@ def _install_artifacts(m: model_registry.Model, models_dir: str,
             return 1
         _safe_print(f"  Fetching {len(m.lens_artifact_files)} Lens artifact(s) "
                     f"→ {lens_dir}")
-        for fname in m.lens_artifact_files:
+        # The directory is one bundle: a cost field plus calibration files
+        # fitted to it. If it identifies another model, skipping "already
+        # present" files would leave that model's identity in place (the
+        # lens then refuses to start), and overwriting only our files would
+        # pair our cost field with its calibration.
+        owner = _lens_bundle_owner(lens_dir)
+        if (owner and not args.force_artifacts
+                and publishing.canonical_model_identity(owner)
+                not in (publishing.canonical_model_identity(m.name),
+                        publishing.canonical_model_identity(m.model_file))):
+            _safe_print(f"    {RED if color else ''}{lens_dir} holds the Lens "
+                        f"bundle for {owner}; not mixing {m.name}'s files "
+                        f"into it.{RESET if color else ''}")
+            _safe_print(f"    Set ATLAS_LENS_MODELS=./models/lens/{m.name} in "
+                        f".env and re-run `atlas model install-artifacts "
+                        f"{m.name}`, or pass --force-artifacts to overwrite.")
+            failures += 1
+            attempted += 1
+            lens_files = []
+        else:
+            lens_files = m.lens_artifact_files
+        for fname in lens_files:
             target_path = os.path.join(lens_dir, fname)
             if os.path.isfile(target_path) and not args.force_artifacts:
                 _safe_print(f"    [skip] {fname} already present")
@@ -610,6 +632,17 @@ def _install_artifacts(m: model_registry.Model, models_dir: str,
         return 1
     _safe_print(f"  {GREEN if color else ''}All artifacts present.{RESET if color else ''}")
     return 0
+
+
+def _lens_bundle_owner(lens_dir: str) -> str:
+    """The model named by the bundle's model_identity.json, or "" when
+    the directory has none (or an unreadable one)."""
+    try:
+        with open(os.path.join(lens_dir, "model_identity.json")) as fh:
+            ident = json.load(fh)
+    except (OSError, ValueError):
+        return ""
+    return str(ident.get("model") or "") if isinstance(ident, dict) else ""
 
 
 def _download_artifact(url: str, target_path: str, color: bool,

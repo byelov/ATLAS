@@ -954,6 +954,42 @@ def test_install_artifacts_replaces_cross_model_asa_vector(tmp_path,
         "Qwen3.5-9B-Q6_K"
 
 
+def test_install_artifacts_refuses_to_mix_into_another_models_lens_bundle(
+        tmp_path, monkeypatch, capsys):
+    """A Lens dir is one bundle (cost field + calibration fitted to it). The
+    repo's shared default carries another model's identity; skipping its
+    "already present" model_identity.json used to leave the lens refusing
+    to start. Refuse and point at a per-model dir; --force-artifacts still
+    overwrites."""
+    lens_dir = tmp_path / "lens"
+    lens_dir.mkdir()
+    (lens_dir / "model_identity.json").write_text(
+        '{"model": "gemma-4-12b-it-Q4_K_M", "embedding_dim": 3840}')
+    (lens_dir / "cx_normalization.json").write_text('{"midpoint": 10.5}')
+    monkeypatch.setenv("ATLAS_LENS_MODELS", str(lens_dir))
+    captured: list = []
+    _install_with_fake_urlopen(monkeypatch, body=b"NEW", status=200,
+                                captured=captured)
+    _patch_registry_artifact_hashes(monkeypatch, "Qwen3.5-9B-Q6_K", b"NEW")
+
+    rc = model.main(["install-artifacts", "Qwen3.5-9B-Q6_K",
+                     "--models-dir", str(tmp_path), "--no-color"])
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert "Lens bundle for gemma-4-12b-it-Q4_K_M" in out
+    assert "ATLAS_LENS_MODELS=./models/lens/Qwen3.5-9B-Q6_K" in out
+    # Nothing written into the foreign bundle; ASA (models dir) still fetched.
+    assert not (lens_dir / "cost_field.pt").exists()
+    assert [u for u in (r.full_url for r in captured) if "cost_field" in u] == []
+    assert (tmp_path / "ast_edit_steering.gguf").is_file()
+
+    rc = model.main(["install-artifacts", "Qwen3.5-9B-Q6_K",
+                     "--models-dir", str(tmp_path),
+                     "--force-artifacts", "--no-color"])
+    assert rc == 0
+    assert (lens_dir / "cost_field.pt").read_bytes() == b"NEW"
+
+
 def test_install_artifacts_rejects_hash_mismatch(tmp_path, monkeypatch, capsys):
     """A downloaded artifact whose bytes don't match the registry hash
     must fail the install and leave nothing at the target path — lens
