@@ -157,8 +157,51 @@ def _candidate_by_index(candidates: List[Dict[str, Any]], index: int) -> Optiona
     return next((c for c in candidates if c.get("index") == index), None)
 
 
+# A candidate that reads no stdin and has no function taking arguments prints
+# the same output for every test input, so only the cases that feed it no
+# input can apply. SelfTestGen still writes cases like "INPUT: (Modified
+# script logic to test range(0, 5))" for such programs — tests of a different
+# program — and those failed every correct candidate (FizzBuzz scored 1/5).
+_READS_INPUT_RE = re.compile(
+    r"\binput\s*\(|sys\.stdin|\bfileinput\b|open\(\s*0\b|sys\.argv")
+_PARAM_FN_RE = re.compile(r"^def \w+\(\s*(?!\))", re.MULTILINE)
+_NO_INPUT_RE = re.compile(
+    r"^\(?\s*(?:no(?:ne)?|n/a|empty|nothing)\b|\bno (?:stdin|input)\b",
+    re.IGNORECASE)
+
+
+def _applicable_self_tests(code: str, cases):
+    """The test cases that can apply to this candidate (see above). When
+    none of the cases is a no-input case, all apply: a program that ignores
+    input the task requires must still fail them."""
+    cases = list(cases)
+    if _READS_INPUT_RE.search(code) or _PARAM_FN_RE.search(code):
+        return cases
+    no_input = [tc for tc in cases
+                if not tc.input_str.strip() or _NO_INPUT_RE.search(tc.input_str.strip())]
+    return no_input or cases
+
+
+def _failure_line(stderr: str) -> str:
+    """The informative end of a failed test's stderr — the exception line,
+    not the "Traceback (most recent call last):" header — for repair."""
+    lines = [ln.strip() for ln in (stderr or "").splitlines() if ln.strip()]
+    return lines[-1][:160] if lines else "wrong"
+
+
 def _make_self_test(code: str, tc) -> str:
     """Build executable assertion code for a single test case.
+
+    SelfTestGen writes stdin/stdout cases ("INPUT: the stdin input", "OUTPUT:
+    the expected stdout"), so the candidate runs the way a user runs it: as a
+    script (__name__ == "__main__") with the input on stdin, compared on its
+    stdout. Only when that doesn't match and the candidate is function-style
+    (defines a function, never calls input()) is its first function called
+    with the input parsed as Python literals and the return value compared —
+    the function-signature task form. Calling the function first failed every
+    script whose main() takes no arguments (TypeError), and exec'ing with the
+    harness's own globals left __name__ as "solution" (the sandbox imports the
+    harness), so a __main__ guard never ran and printed nothing.
 
     Uses ast.literal_eval (safe — only parses Python literals) to convert
     I/O string representations to actual values for comparison.
@@ -166,27 +209,37 @@ def _make_self_test(code: str, tc) -> str:
     """
     inp = tc.input_str.strip()
     exp = tc.expected_output.strip()
-    fn = re.search(r'^def (\w+)\(', code, re.MULTILINE)
-    if fn and 'input()' not in code:
-        name = fn.group(1)
-        return (code + "\nimport ast as _a\n"
-            + f"_i={repr(inp)}\n_e={repr(exp)}\n"
-            + "try:\n _p=_a.literal_eval(_i)\nexcept:\n _p=_i\n"  # noqa: E722  -- bare except inside generated user code, intentional
-            + f"_r={name}(*_p) if isinstance(_p,tuple) else {name}(_p) if isinstance(_p,list) else {name}(_p)\n"
-            + "try:\n _ev=_a.literal_eval(_e)\nexcept:\n _ev=_e\n"  # noqa: E722  -- bare except inside generated user code, intentional
-            + "assert str(_r)==str(_ev) or _r==_ev,f'got {_r}'\nprint('SELF_TEST_PASS')\n")
     # exec the candidate from a string literal instead of splicing its lines
     # under `try:` — per-line indenting corrupts multiline string literals
-    # inside the candidate. exec(..., globals()) keeps the namespace (and
-    # __name__) identical to the previous inline form.
-    return (
-        "import sys as _s,io as _o\n"
+    # inside the candidate. SystemExit (sys.exit(main())) ends the script
+    # normally; its output is still compared.
+    harness = (
+        "import sys as _s,io as _o,ast as _a\n"
         f"_s.stdin=_o.StringIO({repr(inp)})\n"
         "_c=_o.StringIO()\n_old=_s.stdout\n_s.stdout=_c\n"
         f"_src={repr(code)}\n"
-        "try:\n    exec(compile(_src,'solution.py','exec'),globals())\nfinally:\n _s.stdout=_old\n"
-        f"assert _c.getvalue().strip()=={repr(exp)},f'got {{_c.getvalue().strip()}}'\n"
-        "print('SELF_TEST_PASS')\n")
+        "_g={'__name__':'__main__','__builtins__':__builtins__}\n"
+        "try:\n    exec(compile(_src,'solution.py','exec'),_g)\n"
+        "except SystemExit:\n    pass\n"
+        "finally:\n    _s.stdout=_old\n"
+        f"_i={repr(inp)}\n_e={repr(exp)}\n"
+        "_got=_c.getvalue().strip()\n")
+    fn = re.search(r'^def (\w+)\(', code, re.MULTILINE)
+    if fn and 'input()' not in code:
+        # A zero-argument function is a script's main(), not a
+        # function-signature task: keep the stdout verdict ("got ...")
+        # instead of a TypeError from calling it with the input.
+        harness += (
+            "import inspect as _n\n"
+            f"_f=_g.get({repr(fn.group(1))})\n"
+            "if _got!=_e and callable(_f) and _n.signature(_f).parameters:\n"
+            "    try:\n        _p=_a.literal_eval(_i)\n"
+            "    except Exception:\n        _p=_i\n"
+            "    _r=_f(*_p) if isinstance(_p,tuple) else _f(_p)\n"
+            "    try:\n        _ev=_a.literal_eval(_e)\n"
+            "    except Exception:\n        _ev=_e\n"
+            "    _got=_e if (str(_r)==str(_ev) or _r==_ev) else repr(_r)\n")
+    return harness + "assert _got==_e,f'got {_got}'\nprint('SELF_TEST_PASS')\n"
 
 
 class V3PipelineService:
@@ -359,6 +412,7 @@ class V3PipelineService:
                 raise adapters.ClientDisconnected(f"client disconnected during task {task_id}")
 
         llm = adapters.LLMAdapter(progress_callback=emit)
+        llm.should_abort = lambda: getattr(progress_callback, "disconnected", False)
         # PC-046: ship the user's other project files into the sandbox so
         # multi-file imports resolve. `files` is the same Dict that V3
         # already prepends to the LLM prompt above; passing it to the
@@ -489,19 +543,22 @@ class V3PipelineService:
             if not ok:
                 return False, out, err, verification_evidence
             if self_tests and self_tests.test_cases:
+                cases = _applicable_self_tests(code, self_tests.test_cases)
+                skipped = len(self_tests.test_cases) - len(cases)
                 p, fails = 0, []
-                for i, tc in enumerate(self_tests.test_cases):
+                for i, tc in enumerate(cases):
                     try:
                         tc_code = _make_self_test(code, tc)
                         tp, to, te = sandbox(tc_code)
                         if tp and "SELF_TEST_PASS" in to:
                             p += 1
                         else:
-                            fails.append(f"TC{i+1}:{te[:60] if te else 'wrong'}")
+                            fails.append(f"TC{i+1}:{_failure_line(te)}")
                     except Exception as ex:
                         fails.append(f"TC{i+1}:{str(ex)[:40]}")
-                total = len(self_tests.test_cases)
-                emit("self_test_verify", f"{p}/{total} passed")
+                total = len(cases)
+                emit("self_test_verify", f"{p}/{total} passed" + (
+                    f" ({skipped} skipped: the program reads no input)" if skipped else ""))
                 if total > 0 and p < total / 2:
                     return False, out, f"Self-test:{p}/{total}. "+";".join(fails[:3]), verification_evidence
             return verify_build_if_requested(out, err)

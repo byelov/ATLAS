@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -30,6 +31,38 @@ func v3CallTimeout() time.Duration {
 // ---------------------------------------------------------------------------
 // V3 Bridge — Go ↔ Python V3 service communication
 // ---------------------------------------------------------------------------
+
+// v3NoResultError is returned when the V3 stream ends without a result
+// event. It wraps the request context's error when the deadline or a cancel
+// ended the stream — so callers' errors.Is(err, context.DeadlineExceeded)
+// holds — and keeps V3's last sandbox verdict for v3FallbackNote.
+type v3NoResultError struct {
+	cause   error
+	verdict string // last "sandbox_done" detail, e.g. "0/3 passed"
+}
+
+func (e *v3NoResultError) Error() string {
+	if e.cause != nil {
+		return "V3 service completed without result: " + e.cause.Error()
+	}
+	return "V3 service completed without result"
+}
+
+func (e *v3NoResultError) Unwrap() error { return e.cause }
+
+// v3FallbackNote tells the agent what V3 found before it gave up, when that
+// is "no candidate passed its tests". The fallback then writes the agent's
+// own content, and a bare bytes_written would read as verified.
+func v3FallbackNote(err error) string {
+	var nr *v3NoResultError
+	if !errors.As(err, &nr) || !strings.HasPrefix(nr.verdict, "0/") {
+		return ""
+	}
+	return fmt.Sprintf("V3 ran candidates for this file against tests it generated "+
+		"from the task, and none passed (%s); your version was written "+
+		"unverified. Run it and check its output against what the task "+
+		"asks for before reporting done.", nr.verdict)
+}
 
 // V3ProgressFn is called for each V3 pipeline progress event.
 // `data` carries the structured payload from the V3 service (since the
@@ -97,6 +130,7 @@ func callV3GenerateStreaming(reqCtx context.Context, v3URL string, req V3Generat
 	scanner.Buffer(make([]byte, 0, 1<<20), 1<<20) // 1MB buffer
 
 	var result *V3GenerateResponse
+	verdict := ""
 
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -130,14 +164,19 @@ func callV3GenerateStreaming(reqCtx context.Context, v3URL string, req V3Generat
 				Detail string                 `json:"detail"`
 				Data   map[string]interface{} `json:"data"`
 			}
-			if json.Unmarshal([]byte(data), &event) == nil && onProgress != nil {
-				onProgress(event.Stage, event.Detail, event.Data)
+			if json.Unmarshal([]byte(data), &event) == nil {
+				if event.Stage == "sandbox_done" {
+					verdict = event.Detail
+				}
+				if onProgress != nil {
+					onProgress(event.Stage, event.Detail, event.Data)
+				}
 			}
 		}
 	}
 
 	if result == nil {
-		return nil, fmt.Errorf("V3 service completed without result")
+		return nil, &v3NoResultError{cause: reqCtx.Err(), verdict: verdict}
 	}
 
 	return result, nil

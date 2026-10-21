@@ -51,6 +51,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -1329,7 +1330,11 @@ func writeFileWithV3(path, baselineContent string, ctx *AgentContext) (*ToolResu
 			msg = fmt.Sprintf("  \u2514\u2500 V3 exceeded %s cap, writing your version", v3CallTimeout())
 		}
 		ctx.Stream("text", map[string]string{"content": msg})
-		return writeFileDirect(path, baselineContent)
+		res, werr := writeFileDirect(path, baselineContent)
+		if res != nil {
+			res.V3Note = v3FallbackNote(err)
+		}
+		return res, werr
 	}
 
 	// Write the winning candidate (or baseline if V3 didn't improve)
@@ -1725,6 +1730,7 @@ func editFileTool() *ToolDef {
 				}
 			}
 			v3Out := V3EditMetadata{}
+			v3Note := ""
 			if fileTier >= Tier2Medium && editWarrantsV3(newContent, cc, ccOK) && ctx.V3URL != "" && !ctx.BypassV3 {
 				log.Printf("[edit_file] V3 pipeline activating for %s (file_tier=%d, req_tier=%d)", input.Path, fileTier, ctx.Tier)
 				improved, meta, err := improveContentWithV3(path, newContent, ctx)
@@ -1739,6 +1745,7 @@ func editFileTool() *ToolDef {
 						}, nil
 					}
 					log.Printf("[edit_file] V3 failed: %v — falling back to direct write", err)
+					v3Note = v3FallbackNote(err)
 				} else if improved != "" {
 					newContent = improved
 					v3Out = meta
@@ -1809,7 +1816,7 @@ func editFileTool() *ToolDef {
 			}
 
 			outBytes, _ := json.Marshal(out)
-			result := &ToolResult{Success: true, Data: outBytes}
+			result := &ToolResult{Success: true, Data: outBytes, V3Note: v3Note}
 			if v3Out.Used {
 				result.V3Used = true
 				result.CandidatesTested = v3Out.CandidatesTested
@@ -2031,6 +2038,7 @@ func structuralEditTool() *ToolDef {
 					input.Selector)}, nil
 			}
 			v3Out := V3EditMetadata{}
+			v3Note := ""
 			oldTier := classifyFileTier(input.Path, source) // pre-edit content
 			newTier := classifyFileTier(input.Path, finalContent)
 			fileTier := oldTier
@@ -2058,6 +2066,7 @@ func structuralEditTool() *ToolDef {
 						}, nil
 					}
 					log.Printf("[structural_edit] V3 failed: %v — falling back to structurally edited content", err)
+					v3Note = v3FallbackNote(err)
 				} else if improved != "" {
 					finalContent = improved
 					v3Out = meta
@@ -2108,7 +2117,7 @@ func structuralEditTool() *ToolDef {
 				BytesNew: len(finalContent),
 			}
 			outBytes, _ := json.Marshal(out)
-			result := &ToolResult{Success: true, Data: outBytes}
+			result := &ToolResult{Success: true, Data: outBytes, V3Note: v3Note}
 			if v3Out.Used {
 				result.V3Used = true
 				result.CandidatesTested = v3Out.CandidatesTested
@@ -3797,20 +3806,68 @@ func buildToolCallSchema() map[string]interface{} {
 	return buildToolCallSchemaForTools(nil)
 }
 
+// orderedProps is a JSON object that marshals its keys in slice order.
+// llama-server's schema-to-grammar conversion keeps property order, so the
+// order here is the order the model must write the keys in. A map would be
+// marshalled alphabetically ("args", "name", "type"): every variant would
+// then start with its own payload key, and the model would have to pick
+// tool_call/text/done by its first key instead of by "type" — the opposite
+// of the {"type": ...} shape the system prompt teaches. Primed by its own
+// tool-call history, it kept opening with "args" and could never emit done.
+type orderedProps []orderedProp
+
+type orderedProp struct {
+	Key   string
+	Value interface{}
+}
+
+func (o orderedProps) MarshalJSON() ([]byte, error) {
+	var buf bytes.Buffer
+	buf.WriteByte('{')
+	for i, p := range o {
+		if i > 0 {
+			buf.WriteByte(',')
+		}
+		k, err := json.Marshal(p.Key)
+		if err != nil {
+			return nil, err
+		}
+		v, err := json.Marshal(p.Value)
+		if err != nil {
+			return nil, err
+		}
+		buf.Write(k)
+		buf.WriteByte(':')
+		buf.Write(v)
+	}
+	buf.WriteByte('}')
+	return buf.Bytes(), nil
+}
+
+// allowedToolNames lists the registry's tools minus excluded, sorted so the
+// grammar is the same on every request (map iteration order is random).
+func allowedToolNames(excluded []string) []string {
+	excludeSet := make(map[string]struct{}, len(excluded))
+	for _, name := range excluded {
+		excludeSet[name] = struct{}{}
+	}
+	names := make([]string, 0, len(toolRegistry))
+	for name := range toolRegistry {
+		if _, skip := excludeSet[name]; !skip {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	return names
+}
+
 // buildToolCallSchemaForTools is the same as buildToolCallSchema, but with
 // the named tools removed from the tool-name enum. Used by callLLMConstrained
 // to ban edit_file/write_file for a single decision step after a write_file
 // rejection on .py/.html (BiasBusters #3, May 2026 research synthesis).
 func buildToolCallSchemaForTools(excluded []string) map[string]interface{} {
-	excludeSet := make(map[string]struct{}, len(excluded))
-	for _, name := range excluded {
-		excludeSet[name] = struct{}{}
-	}
 	toolNames := make([]interface{}, 0, len(toolRegistry))
-	for name := range toolRegistry {
-		if _, skip := excludeSet[name]; skip {
-			continue
-		}
+	for _, name := range allowedToolNames(excluded) {
 		toolNames = append(toolNames, name)
 	}
 
@@ -3819,18 +3876,18 @@ func buildToolCallSchemaForTools(excluded []string) map[string]interface{} {
 			// Tool call variant
 			map[string]interface{}{
 				"type": "object",
-				"properties": map[string]interface{}{
-					"type": map[string]interface{}{
+				"properties": orderedProps{
+					{"type", map[string]interface{}{
 						"type": "string",
 						"enum": []string{"tool_call"},
-					},
-					"name": map[string]interface{}{
+					}},
+					{"name", map[string]interface{}{
 						"type": "string",
 						"enum": toolNames,
-					},
-					"args": map[string]interface{}{
+					}},
+					{"args", map[string]interface{}{
 						"type": "object",
-					},
+					}},
 				},
 				"required":             []string{"type", "name", "args"},
 				"additionalProperties": false,
@@ -3838,14 +3895,14 @@ func buildToolCallSchemaForTools(excluded []string) map[string]interface{} {
 			// Text variant
 			map[string]interface{}{
 				"type": "object",
-				"properties": map[string]interface{}{
-					"type": map[string]interface{}{
+				"properties": orderedProps{
+					{"type", map[string]interface{}{
 						"type": "string",
 						"enum": []string{"text"},
-					},
-					"content": map[string]interface{}{
+					}},
+					{"content", map[string]interface{}{
 						"type": "string",
-					},
+					}},
 				},
 				"required":             []string{"type", "content"},
 				"additionalProperties": false,
@@ -3853,14 +3910,14 @@ func buildToolCallSchemaForTools(excluded []string) map[string]interface{} {
 			// Done variant
 			map[string]interface{}{
 				"type": "object",
-				"properties": map[string]interface{}{
-					"type": map[string]interface{}{
+				"properties": orderedProps{
+					{"type", map[string]interface{}{
 						"type": "string",
 						"enum": []string{"done"},
-					},
-					"summary": map[string]interface{}{
+					}},
+					{"summary", map[string]interface{}{
 						"type": "string",
-					},
+					}},
 				},
 				"required":             []string{"type", "summary"},
 				"additionalProperties": false,
@@ -3913,11 +3970,6 @@ func buildResponseFormat() interface{} {
 // and system prompt rules can be ignored by the model, but the grammar
 // physically cannot emit the banned tool name.
 func buildGBNFGrammarForTools(excluded []string) string {
-	excludeSet := make(map[string]struct{}, len(excluded))
-	for _, name := range excluded {
-		excludeSet[name] = struct{}{}
-	}
-
 	var sb strings.Builder
 
 	// Root: one of the three response types
@@ -3925,10 +3977,7 @@ func buildGBNFGrammarForTools(excluded []string) string {
 
 	// Tool call
 	toolNames := make([]string, 0, len(toolRegistry))
-	for name := range toolRegistry {
-		if _, skip := excludeSet[name]; skip {
-			continue
-		}
+	for _, name := range allowedToolNames(excluded) {
 		toolNames = append(toolNames, fmt.Sprintf(`"\"%s\""`, name))
 	}
 

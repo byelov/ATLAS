@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -8,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -1166,5 +1168,71 @@ func TestInsertAfterRejectsOutOfRangeAndUnreadFiles(t *testing.T) {
 		t.Error("an out-of-range line must be refused")
 	} else if !strings.Contains(res.Error, "out of range") {
 		t.Errorf("error should name the problem, got %q", res.Error)
+	}
+}
+
+// llama-server keeps schema property order when it builds the grammar, so the
+// wire order is the order the model must write keys in. "type" must come
+// first in every variant: with Go's alphabetical map order the first key
+// ("args"/"content"/"summary") picked the variant, and a model primed by its
+// own tool-call history could never open with "summary" to finish.
+func TestToolCallSchema_TypeIsTheFirstKeyOfEveryVariant(t *testing.T) {
+	t.Setenv("ATLAS_GRAMMAR_MODE", "strict")
+	raw, err := json.Marshal(buildResponseFormat())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wire struct {
+		Schema struct {
+			OneOf []struct {
+				Properties json.RawMessage `json:"properties"`
+			} `json:"oneOf"`
+		} `json:"schema"`
+	}
+	if err := json.Unmarshal(raw, &wire); err != nil {
+		t.Fatal(err)
+	}
+	want := [][]string{{"type", "name", "args"}, {"type", "content"}, {"type", "summary"}}
+	if len(wire.Schema.OneOf) != len(want) {
+		t.Fatalf("got %d variants, want %d", len(wire.Schema.OneOf), len(want))
+	}
+	for i, v := range wire.Schema.OneOf {
+		dec := json.NewDecoder(bytes.NewReader(v.Properties))
+		if _, err := dec.Token(); err != nil { // {
+			t.Fatal(err)
+		}
+		var keys []string
+		for dec.More() {
+			tok, err := dec.Token()
+			if err != nil {
+				t.Fatal(err)
+			}
+			keys = append(keys, tok.(string))
+			var skip json.RawMessage
+			if err := dec.Decode(&skip); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if strings.Join(keys, ",") != strings.Join(want[i], ",") {
+			t.Errorf("variant %d property order = %v, want %v", i, keys, want[i])
+		}
+	}
+}
+
+func TestToolNameEnumIsSortedAndHonorsExclusions(t *testing.T) {
+	names := allowedToolNames([]string{"write_file"})
+	if !sort.StringsAreSorted(names) {
+		t.Errorf("tool names not sorted: %v", names)
+	}
+	for _, n := range names {
+		if n == "write_file" {
+			t.Error("excluded tool still in enum")
+		}
+	}
+	if len(names) != len(toolRegistry)-1 {
+		t.Errorf("got %d names, want %d", len(names), len(toolRegistry)-1)
+	}
+	if g := buildGBNFGrammarForTools(nil); g != buildGBNFGrammarForTools(nil) {
+		t.Error("GBNF grammar differs between calls")
 	}
 }

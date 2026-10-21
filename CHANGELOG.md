@@ -20,6 +20,17 @@
 - `inference/patches/expose-hidden-states.patch` installs a ggml eval callback that answered "yes, observe this node" to the scheduler for every node, even with no capture requested. The scheduler then computes the graph one node at a time with a device sync after each. It now answers yes only for the requested `l_out-N` layers. Qwen3.5-9B-Q6_K on an M1 Ultra: 1.9 → 50 tok/s generation, 30 → 290 tok/s prompt; captured hidden states are bit-identical. CUDA, ROCm and Vulkan images apply the same patch.
 - `atlas-setup-macos.sh` records the patch hash next to the pinned SHA, so a patch change rebuilds the native llama-server without `--rebuild`.
 
+### Fixed: the agent could not finish a task
+- The proxy's tool-call JSON schema was built from Go maps, which marshal keys alphabetically, and llama-server's grammar keeps schema property order. Every variant therefore had to open with its payload key (`args`, `content` or `summary`) instead of `type`, the opposite of the `{"type": ...}` shape the system prompt teaches. Primed by its own tool-call history, the model opened with `args` and could never emit `done`: it put its final answer into `run_command {"content": ...}` until the loop gave up (50+ turns observed). Properties are now ordered `type` first; on the same captured turn, the model answers `{"type":"done",...}`. The tool-name enum is sorted, so the grammar is identical on every request.
+- When V3 hits its interactive cap, the error now wraps `context.DeadlineExceeded` (the fallback said "V3 unavailable" instead of "V3 exceeded the cap"). If V3 had seen every candidate fail its tests, the write result carries a `v3_note` saying the agent's version landed unverified, so the model checks it instead of reading `bytes_written` as verified.
+- V3 stops generating as soon as the proxy disconnects: the LLM adapter checks the client after every streamed token. It used to finish the current phase, holding a llama-server slot for minutes after the proxy had given up.
+
+### Fixed: V3 self-tests rejected correct scripts
+- The self-test harness called a candidate's first function with the test input whenever it defined one, so every script with a zero-argument `main()` failed (`TypeError`). It also exec'd the candidate under the sandbox's module name, so a `__main__` guard never ran. Candidates now run as scripts (`__name__ == "__main__"`, input on stdin, `sys.exit()` allowed) and are compared on stdout; the function-call form remains the fallback for functions that take arguments.
+- For a program that reads no input, only no-input test cases apply. The generator was writing cases such as "INPUT: (Modified script logic to test range(0, 5))", which no correct candidate can pass; its prompt now asks for a single `INPUT: (none)` case for such programs.
+- Failed self-tests report the exception line to the repair phase instead of the first 60 characters of the traceback header.
+- v3-service no longer logs every streamed token (about 10,000 lines per job, and launchd logs are not rotated).
+
 ### Fixed: `atlas doctor` reported auth enforced while the sandbox ran open
 - `internal_auth` probed only the proxy. It now also sends the sandbox an empty `/syntax-check` with a wrong token (nothing executes either way) and fails if that isn't a 401. An executor that can't read `secrets/service-token` starts with auth off.
 

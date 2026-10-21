@@ -35,7 +35,8 @@ from symbols import (structural_edit, structural_score, build_project_symbols,
 # The handler does not call these; tests exercise them through `import main`.
 # __all__ below states that so linters stop reading them as dead imports —
 # deleting any of them breaks the suite, which is the failure this guards.
-from pipeline import _candidate_by_index, _make_self_test
+from pipeline import (_candidate_by_index, _make_self_test,
+                      _applicable_self_tests, _failure_line)
 from planning import _score_plan
 from scoring import (verify_build_command, smoke_compile_check,
                      score_candidate_per_step, _project_relative_path)
@@ -44,6 +45,7 @@ from symbols import _ast_selector_to_query
 __all__ = [
     # Re-exported for tests that reach them via `import main`.
     "_candidate_by_index", "_make_self_test", "_score_plan",
+    "_applicable_self_tests", "_failure_line",
     "verify_build_command", "smoke_compile_check", "score_candidate_per_step",
     "_project_relative_path", "_ast_selector_to_query",
     "_symbol_index_for_python_source", "_STRUCTURAL_EDIT_AVAILABLE",
@@ -192,11 +194,13 @@ class V3Handler(BaseHTTPRequestHandler):
             try:
                 self.wfile.write(f"data: {event}\n\n".encode())
                 self.wfile.flush()
-                # Also log for debugging
-                print(f"  [SSE] {stage}: {detail[:80]}", flush=True)
+                # Also log for debugging — not per-token deltas, which are
+                # redacted anyway and were ~10k log lines per job.
+                if stage != "token":
+                    print(f"  [SSE] {stage}: {detail[:80]}", flush=True)
             except (BrokenPipeError, ConnectionResetError):
-                # Client gone — flag it so pipeline.run aborts at the
-                # next phase boundary instead of grinding on.
+                # Client gone — flag it so the LLM adapter stops at the next
+                # token and pipeline.run aborts instead of grinding on.
                 emit_progress.disconnected = True
             except Exception as e:
                 print(f"  [SSE ERROR] {e}", flush=True)

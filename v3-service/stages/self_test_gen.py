@@ -124,6 +124,8 @@ For each test case, reason about what input would test an important aspect of th
 
 IMPORTANT: Manually trace through the expected computation for each test case to ensure your expected output is correct. Do not guess.
 
+If the program reads no input (its output is fixed), write exactly ONE test case with `INPUT: (none)` and the program's full expected output. Never describe a modified version of the program as an input.
+
 Output format — use EXACTLY this structure for each test case:
 TEST CASE 1:
 DESCRIPTION: <what this tests>

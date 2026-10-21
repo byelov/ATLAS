@@ -14,6 +14,8 @@ import io
 import sys
 from pathlib import Path
 
+import pytest
+
 # v3-service/main.py imports from project root, so we add it the same way
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -120,5 +122,77 @@ def test_make_self_test_function_form_unchanged():
     assert "SELF_TEST_PASS" in out
 
 
+_FIZZBUZZ_15 = "\n".join(
+    "FizzBuzz" if i % 15 == 0 else "Fizz" if i % 3 == 0 else
+    "Buzz" if i % 5 == 0 else str(i) for i in range(1, 16))
+
+_MAIN_GUARDED = (
+    "def fizzbuzz():\n"
+    "    for i in range(1, 16):\n"
+    "        print('FizzBuzz' if i % 15 == 0 else 'Fizz' if i % 3 == 0 else\n"
+    "              'Buzz' if i % 5 == 0 else i)\n"
+    "\n"
+    "if __name__ == '__main__':\n"
+    "    fizzbuzz()\n")
+
+
+def test_make_self_test_runs_a_main_guarded_script_as_a_script():
+    # The common script shape: a zero-argument main() behind a __main__
+    # guard. It used to be called with the test input (TypeError), and the
+    # guard never fired because the sandbox imports the harness as a module.
+    out = _run_generated(_make(_MAIN_GUARDED, _TC("", _FIZZBUZZ_15)))
+    assert "SELF_TEST_PASS" in out
+
+
+def test_make_self_test_main_guarded_script_with_wrong_output_fails():
+    swapped = _MAIN_GUARDED.replace("'Fizz' if i % 3", "'Buzz' if i % 3", 1) \
+        .replace("'Buzz' if i % 5", "'Fizz' if i % 5", 1)
+    with pytest.raises(AssertionError):
+        _run_generated(_make(swapped, _TC("", _FIZZBUZZ_15)))
+
+
+def test_make_self_test_accepts_sys_exit_main():
+    code = ("import sys\n"
+            "def main():\n"
+            "    print(int(sys.stdin.read()) * 2)\n"
+            "    return 0\n"
+            "if __name__ == '__main__':\n"
+            "    sys.exit(main())\n")
+    assert "SELF_TEST_PASS" in _run_generated(_make(code, _TC("21", "42")))
+
+
 def _make(code, tc):
     return v3main._make_self_test(code, tc)
+
+
+# --- _applicable_self_tests / _failure_line ----------------------------------
+
+def test_fixed_output_script_only_runs_no_input_cases():
+    # What SelfTestGen produced for FizzBuzz 1..15: one real case, four
+    # "modified program" cases no correct candidate can pass.
+    cases = [_TC("(No input required; the script runs with hardcoded range)", "1"),
+             _TC("(Modified script logic to test range(0, 5))", "Buzz"),
+             _TC("(Modified script logic to test range(1, 2))", "1")]
+    kept = v3main._applicable_self_tests(_MAIN_GUARDED, cases)
+    assert kept == cases[:1]
+
+
+def test_input_reading_and_function_candidates_keep_every_case():
+    cases = [_TC("3", "6"), _TC("(none)", "0")]
+    reads = "import sys\nprint(int(sys.stdin.read() or 0) * 2)\n"
+    func = "def double(x):\n    return x * 2\n"
+    assert v3main._applicable_self_tests(reads, cases) == cases
+    assert v3main._applicable_self_tests(func, cases) == cases
+
+
+def test_script_ignoring_required_input_still_faces_every_case():
+    # No no-input case at all: the task wants input the script ignores.
+    cases = [_TC("3", "6"), _TC("5", "10")]
+    assert v3main._applicable_self_tests("print(6)\n", cases) == cases
+
+
+def test_failure_line_reports_the_exception_not_the_traceback_header():
+    err = ('Traceback (most recent call last):\n  File "<string>", line 14, in <module>\n'
+           "AssertionError: got 1\n")
+    assert v3main._failure_line(err) == "AssertionError: got 1"
+    assert v3main._failure_line("") == "wrong"

@@ -143,6 +143,15 @@ class LLMAdapter:
         self.total_time_ms = 0.0
         self._progress = progress_callback
         self.thinking = thinking
+        # should_abort() -> True once the SSE client is gone. Checked before
+        # each request and after each streamed token, so a dead client stops
+        # generation within a token instead of at the next phase boundary
+        # (a repair phase is several multi-thousand-token calls).
+        self.should_abort = None
+
+    def _check_abort(self):
+        if self.should_abort is not None and self.should_abort():
+            raise ClientDisconnected("client disconnected during an LLM call")
 
     @property
     def avg_call_ms(self) -> float:
@@ -223,6 +232,7 @@ class LLMAdapter:
         for the chat endpoint. ChatML format:
             <|im_start|>system\n...\n<|im_end|>\n<|im_start|>user\n...\n<|im_end|>\n<|im_start|>assistant\n
         """
+        self._check_abort()
         prompt = body.pop("prompt", "")
         model_name = os.environ.get("ATLAS_MODEL_NAME", "local-model")
 
@@ -316,6 +326,7 @@ class LLMAdapter:
                                 if delta:
                                     full.append(delta)
                                     self._emit("token", delta)
+                                    self._check_abort()
                                 if rdelta:
                                     reasoning.append(rdelta)
                             u = chunk.get("usage")

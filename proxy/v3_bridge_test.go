@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -277,6 +278,57 @@ func TestCallV3GenerateStreamingTimeoutFires(t *testing.T) {
 	}
 	if elapsed > 5*time.Second {
 		t.Errorf("timeout took %v with a 1s cap", elapsed)
+	}
+	// The callers' "V3 exceeded the cap" message keys on this; a fresh
+	// error that didn't wrap the deadline reported "V3 unavailable".
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("err = %v, want it to wrap context.DeadlineExceeded", err)
+	}
+}
+
+func TestV3FallbackNoteReportsFailedTests(t *testing.T) {
+	t.Setenv("ATLAS_V3_TIMEOUT", "1")
+	release := make(chan struct{})
+	srv := fakeGenerateServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		sseLines(w,
+			`data: {"stage":"sandbox_done","detail":"0/3 passed"}`, ``,
+			`data: {"stage":"phase3","detail":"repairing"}`, ``)
+		select { // repair outlives the cap
+		case <-r.Context().Done():
+		case <-release:
+		}
+	})
+	defer srv.Close()
+	defer close(release)
+
+	_, err := callV3GenerateStreaming(context.Background(), srv.URL,
+		V3GenerateRequest{}, nil)
+	note := v3FallbackNote(err)
+	if !strings.Contains(note, "0/3 passed") || !strings.Contains(note, "unverified") {
+		t.Errorf("note = %q, want the failed verdict and 'unverified'", note)
+	}
+}
+
+func TestV3FallbackNoteSilentUnlessNothingPassed(t *testing.T) {
+	srv := fakeGenerateServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		sseLines(w,
+			`data: {"stage":"sandbox_done","detail":"2/3 passed"}`, ``,
+			`data: [DONE]`, ``)
+	})
+	defer srv.Close()
+
+	_, err := callV3GenerateStreaming(context.Background(), srv.URL,
+		V3GenerateRequest{}, nil)
+	if err == nil {
+		t.Fatal("want completed-without-result")
+	}
+	if note := v3FallbackNote(err); note != "" {
+		t.Errorf("note = %q, want none when a candidate passed", note)
+	}
+	if note := v3FallbackNote(errors.New("V3 service returned 503")); note != "" {
+		t.Errorf("note = %q for an unavailable service, want none", note)
 	}
 }
 

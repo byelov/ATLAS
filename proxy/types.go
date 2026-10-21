@@ -107,6 +107,9 @@ type ToolResult struct {
 	WinningScore         float64                  `json:"winning_score,omitempty"`
 	PhaseSolved          string                   `json:"phase_solved,omitempty"`
 	VerificationEvidence []V3VerificationEvidence `json:"verification_evidence,omitempty"`
+	// V3Note: set when V3 gave up and the agent's own content was written
+	// instead, and V3 had seen that content fail (see v3FallbackNote).
+	V3Note string `json:"v3_note,omitempty"`
 }
 
 // MarshalText returns a compact string representation for the model.
